@@ -1688,6 +1688,71 @@ Default: ``{}``
 A dict containing the pipelines enabled by default in Scrapy. You should never
 modify this setting in your project, modify :setting:`ITEM_PIPELINES` instead.
 
+.. setting:: ITEM_PIPELINE_KEY
+
+ITEM_PIPELINE_KEY
+-----------------
+
+.. versionadded:: 2.20.0
+
+Default: ``None``
+
+A callable, or the import path of a callable, with the signature
+``key(item, spider)`` that assigns a processing key to each item. It is called
+once per item, before any item pipeline runs, on the item as first received;
+later changes to the item, including a pipeline returning a different item
+object, do not change the key.
+
+The callable must return one of:
+
+- a string,
+- an integer that is not a boolean,
+- a non-empty tuple made of strings and non-boolean integers,
+- ``None``.
+
+Keys are distinguished by both type and value, so ``1`` and ``"1"`` are
+different keys. An item whose key is ``None`` is not grouped with any other
+item.
+
+Items that share a key are processed one at a time, in the order in which the
+crawler received them. The next item with the same key enters the first
+pipeline only after the previous item has gone through its whole pipeline and
+its :signal:`item_scraped`, :signal:`item_dropped` or :signal:`item_error`
+signal, including asynchronous signal receivers, has finished. Items with
+different keys, including ``None`` keys, keep processing in parallel.
+
+This ordering applies within a single crawler to items coming from different
+responses as well as to items produced by :meth:`~scrapy.Spider.start`. Items
+that have not been consumed from the spider output yet are not ordered.
+
+If the callable raises an exception, or returns a value of an unsupported
+type, the item does not enter the pipelines and the error is reported through
+the :signal:`item_error` signal; other items are not affected.
+
+When this setting is ``None``, items are not grouped and item processing
+behaves as in earlier Scrapy versions.
+
+See :ref:`topics-item-pipeline-ordering`.
+
+.. setting:: ITEM_PIPELINE_MAX_ACTIVE
+
+ITEM_PIPELINE_MAX_ACTIVE
+------------------------
+
+.. versionadded:: 2.20.0
+
+Default: ``100``
+
+A positive integer, which may not be a boolean. It is only used when
+:setting:`ITEM_PIPELINE_KEY` is not ``None``, and limits the number of items
+of the crawler whose processing is in progress at the same time, from the
+moment an item enters the item processor until its :signal:`item_scraped`,
+:signal:`item_dropped` or :signal:`item_error` signal has finished. Items
+waiting for their key do not count toward this limit.
+
+:setting:`CONCURRENT_ITEMS` keeps its meaning of maximum number of items
+processed in parallel per response.
+
 .. setting:: ITEM_PROCESSOR
 
 ITEM_PROCESSOR

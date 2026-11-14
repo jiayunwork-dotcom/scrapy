@@ -66,6 +66,70 @@ item pipelines; only :meth:`process_item` follows the :setting:`ITEM_PIPELINES`
 order.
 
 
+.. _topics-item-pipeline-ordering:
+
+Ordering item processing by business key
+========================================
+
+When the same business record is collected more than once and the collected
+items go through asynchronous pipelines concurrently, an older result can
+finish writing after a newer one. The :setting:`ITEM_PIPELINE_KEY` setting
+groups items by a business key so that items sharing a key finish one after
+another, while items with different keys keep running in parallel.
+
+Define a callable that returns the key of an item:
+
+.. code-block:: python
+
+    def record_key(item, spider):
+        return item["record_id"]
+
+
+    ITEM_PIPELINE_KEY = record_key
+
+The callable can also be given as an import path string. It is called once for
+each item, before any pipeline runs and on the item as first received. If a
+pipeline mutates the item or returns another item object, the key computed at
+reception still applies. Accepted keys are strings, non-boolean integers,
+non-empty tuples of those two types, and ``None``; the type is part of the key,
+so the integer ``1`` and the string ``"1"`` do not group together. An item
+with a ``None`` key runs independently of every other item.
+
+Items with the same key are processed in reception order, across responses and
+items from :meth:`~scrapy.Spider.start`, within one crawler. An item enters the
+first pipeline only after the previous item with the same key has completed
+its whole pipeline and its :signal:`item_scraped`, :signal:`item_dropped` or
+:signal:`item_error` signal, so asynchronous signal receivers that also write
+downstream are covered by the ordering. A :exc:`~scrapy.exceptions.DropItem`
+exception or any other pipeline exception ends the item following the usual
+rules, without retrying it, and the next item with the same key then proceeds.
+
+If the key callable raises, or returns a value of an unsupported type, the
+item skips the pipelines and the exception is reported through
+:signal:`item_error`; this never blocks another item.
+
+:setting:`ITEM_PIPELINE_MAX_ACTIVE` bounds how many items of the crawler are
+being processed at once, counting from entry into the item processor until the
+terminal signal, including asynchronous receivers, has finished. Items waiting
+for their key do not take a slot, and an earlier item held back by a busy key
+does not prevent a later item whose key is free from starting, as long as the
+active limit is not reached. The per-response :setting:`CONCURRENT_ITEMS`
+setting is unchanged.
+
+A crawler waits at shutdown for every item it has received to finish,
+including items still waiting for their key, before closing the item
+processor. Cancelling an item that is still waiting keeps it out of the
+pipelines and suppresses its terminal item signal, without affecting other
+items. Cancelling an item already in the pipelines passes the cancellation on
+to the pipelines as usual; that item keeps its key and its active slot until
+the pipelines and the terminal signal actually finish, so the next item with
+the same key cannot slip in.
+
+Each crawler keeps its own keys and its own active count. When
+:setting:`ITEM_PIPELINE_KEY` is ``None``, none of this applies and items are
+processed as in earlier Scrapy versions.
+
+
 Item pipeline example
 =====================
 

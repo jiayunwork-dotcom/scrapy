@@ -15,6 +15,7 @@ from twisted.internet.defer import Deferred, inlineCallbacks
 from twisted.python.failure import Failure
 
 from scrapy import Spider, signals
+from scrapy.core.itemkeys import _ItemEntry, _ItemScheduler
 from scrapy.core.spidermw import SpiderMiddlewareManager
 from scrapy.exceptions import (
     CloseSpider,
@@ -162,6 +163,36 @@ class Scraper:
         self.crawler: Crawler = crawler
         self.signals: SignalManager = crawler.signals
         self.logformatter: LogFormatter = crawler.logformatter
+        self.item_scheduler: _ItemScheduler | None = self._build_item_scheduler()
+
+    def _build_item_scheduler(self) -> _ItemScheduler | None:
+        key_setting = self.crawler.settings["ITEM_PIPELINE_KEY"]
+        if key_setting is None:
+            return None
+        if not isinstance(key_setting, str) and not callable(key_setting):
+            raise ValueError(
+                "The ITEM_PIPELINE_KEY setting must be a callable or the import"
+                f" path of a callable, got {key_setting!r} of type"
+                f" {type(key_setting).__name__}"
+            )
+        key_function = load_object(key_setting)
+        if not callable(key_function):
+            raise ValueError(
+                "The ITEM_PIPELINE_KEY setting must point to a callable, got"
+                f" {key_setting!r} of type {type(key_function).__name__}"
+            )
+        max_active = self.crawler.settings["ITEM_PIPELINE_MAX_ACTIVE"]
+        if (
+            isinstance(max_active, bool)
+            or not isinstance(max_active, int)
+            or max_active < 1
+        ):
+            raise ValueError(
+                "The ITEM_PIPELINE_MAX_ACTIVE setting must be a positive non-bool"
+                f" integer, got {max_active!r} of type"
+                f" {type(max_active).__name__}"
+            )
+        return _ItemScheduler(max_active, key_function)
 
     def _check_deprecated_itemproc_method(self, method: str) -> None:
         itemproc_cls = type(self.itemproc)
@@ -589,6 +620,56 @@ class Scraper:
         assert self.crawler.spider is not None  # typing
         self.slot.itemproc_size += 1
         try:
+            entry = await self._enqueue_item(item, response)
+            if entry is None:
+                # The item was cancelled while waiting for its key or for an
+                # active slot: it does not enter the pipelines and gets no
+                # terminal signal.
+                return
+            try:
+                await self._run_itemproc(entry)
+            finally:
+                if self.item_scheduler is not None:
+                    self.item_scheduler.task_done(entry)
+        finally:
+            self.slot.itemproc_size -= 1
+            self._check_if_closing()
+
+    async def _enqueue_item(
+        self, item: Any, response: Response | Failure | None
+    ) -> _ItemEntry | None:
+        """Register the item with the scheduler and wait until it may run.
+
+        The key is computed here, before any pipeline runs, from the item as
+        first received. Key callable failures and invalid return values are
+        reported through :signal:`item_error` and keep the item out of the
+        pipelines without affecting other items.
+        """
+        assert self.crawler.spider is not None  # typing
+        scheduler = self.item_scheduler
+        if scheduler is None:
+            entry = _ItemEntry(item, response, None)
+            entry.started = True
+            return entry
+        try:
+            entry = scheduler.receive(item, response, self.crawler.spider)
+        except Exception as ex:
+            await self._send_item_error(item, response, ex)
+            return None
+        try:
+            await scheduler.wait_to_run(entry)
+        except BaseException:
+            # Cancelled while waiting: the scheduler already removed the
+            # entry, and no terminal signal is sent.
+            return None
+        return entry
+
+    async def _run_itemproc(self, entry: _ItemEntry) -> None:
+        """Run the item processor for *entry* and send its terminal signal."""
+        assert self.crawler.spider is not None  # typing
+        item = entry.item
+        response = entry.response
+        try:
             if self._itemproc_has_async["process_item"]:
                 output = await self.itemproc.process_item_async(item)
             else:
@@ -638,9 +719,37 @@ class Scraper:
                 response=response,
                 spider=self.crawler.spider,
             )
-        finally:
-            self.slot.itemproc_size -= 1
-            self._check_if_closing()
+
+    async def _send_item_error(
+        self,
+        item: Any,
+        response: Response | Failure | None,
+        ex: Exception,
+    ) -> None:
+        """Log an item error and wait for its :signal:`item_error` signal,
+        matching the behavior of ordinary pipeline exceptions."""
+        assert self.crawler.spider is not None
+        logkws = self.logformatter.item_error(item, ex, response, self.crawler.spider)
+        logger.log(
+            *logformatter_adapter(logkws),
+            extra={"spider": self.crawler.spider, "item": item},
+            exc_info=True,
+        )
+        await self.signals.send_catch_log_async(
+            signal=signals.item_error,
+            item=item,
+            response=response,
+            spider=self.crawler.spider,
+            failure=Failure(),
+        )
+
+    def _cancel_item(self, entry: _ItemEntry) -> None:
+        """Cancel *entry* if it is still waiting for its key or for an active
+        slot. A running item is not interrupted here: its cancellation follows
+        the usual task cancellation path and keeps its key and active slot
+        until its item processor and terminal signal finish."""
+        if self.item_scheduler is not None:
+            self.item_scheduler.cancel_waiting(entry)
 
 
 def __getattr__(name: str) -> Any:

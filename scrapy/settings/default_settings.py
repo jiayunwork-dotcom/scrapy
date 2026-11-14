@@ -14,6 +14,7 @@ Scrapy developers, if you add a setting here remember to:
 """
 
 import sys
+from collections.abc import Callable
 from importlib import import_module
 from pathlib import Path
 from typing import Any
@@ -143,6 +144,8 @@ __all__ = [
     "IMAGES_STORE_S3_ACL",
     "ITEM_PIPELINES",
     "ITEM_PIPELINES_BASE",
+    "ITEM_PIPELINE_KEY",
+    "ITEM_PIPELINE_MAX_ACTIVE",
     "ITEM_PROCESSOR",
     "JOBDIR",
     "JOBDIR_SYNC_EVERY",
@@ -484,6 +487,10 @@ IMAGES_STORE_S3_ACL = "private"
 
 ITEM_PIPELINES: dict[str, int] = {}
 ITEM_PIPELINES_BASE: dict[str, int] = {}
+
+ITEM_PIPELINE_KEY: Callable[..., Any] | str | None = None
+
+ITEM_PIPELINE_MAX_ACTIVE: int = 100
 
 ITEM_PROCESSOR = "scrapy.pipelines.ItemPipelineManager"
 
