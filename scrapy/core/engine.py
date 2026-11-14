@@ -21,6 +21,7 @@ from twisted.python.failure import Failure
 
 from scrapy import signals
 from scrapy.core.downloader import _start_delay_countdown
+from scrapy.core.downloader._robotsdelay import _ROBOTS_ABORTED_META_KEY
 from scrapy.core.scheduler import BaseScheduler
 from scrapy.core.scraper import Scraper
 from scrapy.exceptions import (
@@ -571,7 +572,10 @@ class ExecutionEngine:
     ) -> Generator[Deferred[Any], Any, None]:
         if (
             isinstance(result, Failure)
-            and self._stop_mode == "fast"
+            and (
+                self._stop_mode == "fast"
+                or request.meta.pop(_ROBOTS_ABORTED_META_KEY, False)
+            )
             and result.check(
                 DownloadCancelledError,
                 CancelledError,
@@ -988,6 +992,11 @@ class ExecutionEngine:
         logger.info(
             "Closing spider (%(reason)s)", {"reason": reason}, extra={"spider": spider}
         )
+
+        # Requests waiting for a robots.txt interval must not delay the close,
+        # nor keep the slot from draining. Drop them now.
+        if hasattr(self.downloader, "_abort_robots_waits"):
+            self.downloader._abort_robots_waits()
 
         if self._stop_mode == "fast":
             await self._fast_stop_downloader()

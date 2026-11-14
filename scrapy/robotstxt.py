@@ -73,6 +73,16 @@ class RobotParser(metaclass=ABCMeta):
         """
         return None
 
+    def request_rate(self, user_agent: str | bytes) -> tuple[int, float] | None:
+        """Return the ``Request-rate`` directive for ``user_agent`` as a
+        ``(requests, seconds)`` tuple, meaning that at most *requests* requests
+        may be sent in any *seconds* second period, or ``None`` if it is not set
+        or the backend does not support it.
+
+        .. versionadded:: 2.21.0
+        """
+        return None
+
     def sitemaps(self) -> Iterable[str]:
         """Return the sitemap URLs declared through the ``Sitemap`` directive
         of the robots.txt file, or an empty iterable if there are none or the
@@ -103,6 +113,12 @@ class PythonRobotParser(RobotParser):
     def crawl_delay(self, user_agent: str | bytes) -> float | None:
         delay = self.rp.crawl_delay(to_unicode(user_agent))
         return None if delay is None else float(delay)
+
+    def request_rate(self, user_agent: str | bytes) -> tuple[int, float] | None:
+        rate = self.rp.request_rate(to_unicode(user_agent))
+        if rate is None:
+            return None
+        return rate.requests, float(rate.seconds)
 
 
 class RerpRobotParser(RobotParser):
@@ -151,6 +167,12 @@ class ProtegoRobotParser(RobotParser):
     def crawl_delay(self, user_agent: str | bytes) -> float | None:
         delay = self.rp.crawl_delay(to_unicode(user_agent))
         return None if delay is None else float(delay)
+
+    def request_rate(self, user_agent: str | bytes) -> tuple[int, float] | None:
+        rate = self.rp.request_rate(to_unicode(user_agent))
+        if rate is None:
+            return None
+        return rate.requests, float(rate.seconds)
 
     def sitemaps(self) -> Iterable[str]:
         return self.rp.sitemaps

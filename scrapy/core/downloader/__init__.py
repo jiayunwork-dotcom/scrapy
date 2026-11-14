@@ -14,6 +14,12 @@ from typing import TYPE_CHECKING, Any
 from twisted.internet.defer import Deferred, DeferredList, inlineCallbacks
 
 from scrapy import Request, Spider, signals
+from scrapy.core.downloader._robotsdelay import (
+    _ROBOTS_DELAY_META_KEY,
+    _ROBOTS_START_META_KEY,
+    _RobotsThrottle,
+    _Waiter,
+)
 from scrapy.core.downloader.handlers import DownloadHandlers
 from scrapy.core.downloader.middleware import DownloaderMiddlewareManager
 from scrapy.exceptions import DownloadCancelledError, ScrapyDeprecationWarning
@@ -256,6 +262,20 @@ class Downloader:
             "DOWNLOAD_SLOTS"
         )
         self._stats = crawler.stats
+        # Whether robots.txt delay tracking is enabled at all.
+        self._robots_delay_enabled: bool = bool(
+            self.settings.getbool("ROBOTSTXT_OBEY")
+            and self.settings.getbool("ROBOTSTXT_OBEY_DELAY")
+        )
+        self._robots_throttle: _RobotsThrottle | None = (
+            _RobotsThrottle(self._stats) if self._robots_delay_enabled else None
+        )
+        # Number of requests waiting for their robots.txt interval. They hold
+        # no concurrency spot, so they are not counted toward
+        # CONCURRENT_REQUESTS.
+        self._robots_waiting: int = 0
+        # Granted robots.txt waiters, by request, until the request starts.
+        self._robots_starters: dict[Request, _Waiter] = {}
         # (reason, start_time): current backout reason and when it began, or
         # (None, None) if not backing out.
         self._last_backout: tuple[str | None, float | None] = (None, None)
@@ -335,7 +355,11 @@ class Downloader:
 
     def needs_backout(self) -> bool:
         # A total concurrency of 0 means no limit.
-        if 0 < self.total_concurrency <= len(self.active):
+        # Requests waiting for their robots.txt interval hold no download
+        # concurrency spot, so they must not stop the engine from feeding
+        # requests for other websites.
+        active = len(self.active) - self._robots_waiting
+        if 0 < self.total_concurrency <= active:
             self._record_backout("concurrency")
             return True
         if self._exceeds_max_active_size() and not self._size_stall_ended():
@@ -483,6 +507,61 @@ class Downloader:
             raise DownloadCancelledError(
                 "The downloader is shutting down and not accepting new requests"
             )
+        robots = self._robots_delay(request)
+        if robots is not None:
+            return await self._enqueue_robots_delayed(request, robots)
+        return await self._enqueue_into_slot(request)
+
+    def _robots_delay(self, request: Request) -> tuple[str, float] | None:
+        """Return the site key and the robots.txt interval of *request*, or
+        ``None`` if it is not subject to one."""
+        meta = request.meta.pop(_ROBOTS_DELAY_META_KEY, None)
+        if self._robots_throttle is None or meta is None:
+            return None
+        # A request that skips the robots.txt checks must not wait either, even
+        # if it inherited the state of the request it was derived from.
+        if request.meta.get("dont_obey_robotstxt"):
+            return None
+        if request.url.startswith(("data:", "file:")):
+            return None
+        return meta
+
+    async def _enqueue_robots_delayed(
+        self, request: Request, robots: tuple[str, float]
+    ) -> Response:
+        site, delay = robots
+        assert self._robots_throttle is not None
+        # The wait must not take a concurrency spot, so that a request waiting
+        # for its robots.txt interval does not hold back other requests, e.g.
+        # requests to other websites. For the same reason it must not count
+        # toward RESPONSE_MAX_ACTIVE_SIZE while it waits: it is not downloading
+        # anything yet.
+        self._robots_waiting += 1
+        self.middleware._discount_rough_size(request)
+        try:
+            waiter = await self._robots_throttle.acquire(
+                site, delay, request.priority, request
+            )
+        finally:
+            self._robots_waiting -= 1
+        self.middleware._count_rough_size(request)
+        if not self._accepting_requests:
+            self._robots_throttle.abandon(waiter)
+            raise DownloadCancelledError(
+                "The downloader is shutting down and not accepting new requests"
+            )
+        # The request may start now. It gets a slot only at this point, so its
+        # wait did not hold a concurrency spot or count toward
+        # CONCURRENT_REQUESTS.
+        if waiter.waited:
+            self._stats.inc_value("robotstxt/delayed_count")
+        return await self._enqueue_into_slot(request, robots_waiter=waiter)
+
+    async def _enqueue_into_slot(
+        self,
+        request: Request,
+        robots_waiter: _Waiter | None = None,
+    ) -> Response:
         key, slot = self._get_slot(request)
         # Requests derived from this one (redirects, retries) copy its meta.
         # The stamp tells a slot the downloader assigned, which they must
@@ -498,6 +577,8 @@ class Downloader:
             request=request,
             spider=self.crawler.spider,
         )
+        if robots_waiter is not None:
+            self._robots_starters[request] = robots_waiter
         d: Deferred[Response] = Deferred()
         slot.queue.append((request, d))
         if request not in self.middleware._unscheduled_requests:
@@ -565,6 +646,10 @@ class Downloader:
         # both instead.
         if request in slot.transferring:
             self._end_transfer(slot, request)
+        waiter = self._robots_starters.pop(request, None)
+        if waiter is not None:
+            # The request was granted a robots.txt start that it never used.
+            self._abandon_robots(waiter)
         if not queue_dfd.called:
             queue_dfd.errback(result)
         return result
@@ -576,6 +661,13 @@ class Downloader:
     async def _download(self, slot: Slot, request: Request) -> Response:
         # The order is very important for the following logic. Do not change!
         try:
+            waiter = self._robots_starters.pop(request, None)
+            if waiter is not None and self._robots_throttle is not None:
+                # This request is being handed to the download handler now,
+                # i.e. its start happens now.
+                self._robots_throttle.started(waiter)
+            else:
+                self._record_robots_start(request)
             # 1. Download the response
             response: Response = await self.handlers.download_request_async(request)
             # Counted before _end_transfer() resumes queued requests, so that
@@ -748,12 +840,16 @@ class Downloader:
         self._accepting_requests = False
 
         dropped_count = 0
+        dropped_count += self._abort_robots_waits()
 
         for slot in self.slots.values():
             slot.close()
             while slot.queue:
                 request, queue_dfd = slot.queue.popleft()
                 dropped_count += 1
+                waiter = self._robots_starters.pop(request, None)
+                if waiter is not None:
+                    self._abandon_robots(waiter)
                 if not queue_dfd.called:
                     queue_dfd.errback(
                         DownloadCancelledError(
@@ -783,6 +879,24 @@ class Downloader:
             )
 
         return dropped_count
+
+    def _abandon_robots(self, waiter: _Waiter) -> None:
+        """Give up the start that *waiter* was granted, without recording it."""
+        if self._robots_throttle is not None:
+            self._robots_throttle.abandon(waiter)
+
+    def _record_robots_start(self, request: Request) -> None:
+        """Record that *request* is starting, for its robots.txt interval."""
+        robots = request.meta.pop(_ROBOTS_START_META_KEY, None)
+        if robots is not None and self._robots_throttle is not None:
+            self._robots_throttle.record_start(robots)
+
+    def _abort_robots_waits(self) -> int:
+        """Stop waiting for robots.txt intervals and drop the requests that
+        were waiting, e.g. when the spider is closing."""
+        if self._robots_throttle is None:
+            return 0
+        return self._robots_throttle.abort()
 
     def close(self) -> None:
         self._accepting_requests = False

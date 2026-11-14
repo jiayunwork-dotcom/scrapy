@@ -106,6 +106,23 @@ class TestRobotParserBase(ABC):
         rp = self._parse(robotstxt_body)
         assert rp.crawl_delay("*") is None
 
+    def test_request_rate(self) -> None:
+        robotstxt_body = b"User-agent: *\nDisallow: /private\nRequest-rate: 4/20\n"
+        rp = self._parse(robotstxt_body)
+        assert rp.request_rate("*") == (4, 20.0)
+
+    def test_request_rate_unset(self) -> None:
+        robotstxt_body = b"User-agent: *\nDisallow: /private\n"
+        rp = self._parse(robotstxt_body)
+        assert rp.request_rate("*") is None
+
+    def test_request_rate_time_window(self) -> None:
+        # The time window of Request-rate is unsupported, and the rate it
+        # applies is read as if the window covered the whole day.
+        robotstxt_body = b"User-agent: *\nRequest-rate: 3/10 0600-0845\n"
+        rp = self._parse(robotstxt_body)
+        assert rp.request_rate("*") == (3, 10.0)
+
     def test_sitemaps(self) -> None:
         robotstxt_body = (
             b"User-agent: *\nDisallow: /private\n"
@@ -155,6 +172,20 @@ class TestRobotParser:
             AllowAllRobotParser, NO_CRAWLER, b"User-agent: *\nCrawl-delay: 10\n"
         )
         assert rp.crawl_delay("*") is None
+
+    def test_request_rate_unsupported(self) -> None:
+        class AllowAllRobotParser(RobotParser):
+            @classmethod
+            def from_crawler(cls, crawler: Crawler, robotstxt_body: bytes) -> Self:
+                return cls()
+
+            def allowed(self, url: str | bytes, user_agent: str | bytes) -> bool:
+                return True
+
+        rp = build_from_crawler(
+            AllowAllRobotParser, NO_CRAWLER, b"User-agent: *\nRequest-rate: 4/20\n"
+        )
+        assert rp.request_rate("*") is None
 
     def test_sitemaps_unsupported(self) -> None:
         class AllowAllRobotParser(RobotParser):
@@ -218,6 +249,9 @@ class TestPythonRobotParser(TestRobotParserBase):
     def test_sitemaps(self) -> None:
         pytest.skip("RobotFileParser does not support the Sitemap directive.")
 
+    def test_request_rate_time_window(self) -> None:
+        pytest.skip("RobotFileParser does not support Request-rate time windows.")
+
 
 @pytest.mark.skipif(not rerp_available(), reason="Rerp parser is not installed")
 class TestRerpRobotParser(TestRobotParserBase):
@@ -225,6 +259,15 @@ class TestRerpRobotParser(TestRobotParserBase):
 
     def test_length_based_precedence(self) -> None:
         pytest.skip("Rerp does not support length based directives precedence.")
+
+    def test_request_rate(self) -> None:
+        pytest.skip("Rerp does not support the Request-rate directive.")
+
+    def test_request_rate_unset(self) -> None:
+        pytest.skip("Rerp does not support the Request-rate directive.")
+
+    def test_request_rate_time_window(self) -> None:
+        pytest.skip("Rerp does not support the Request-rate directive.")
 
 
 class TestProtegoRobotParser(TestRobotParserBase):

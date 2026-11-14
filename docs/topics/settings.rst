@@ -2101,6 +2101,26 @@ for each request being downloaded, whose actual response size is not known yet.
 
 ``None`` lets Scrapy choose a value. ``0`` counts only responses.
 
+.. setting:: ROBOTSTXT_MAX_DELAY
+
+ROBOTSTXT_MAX_DELAY
+-------------------
+
+.. versionadded:: 2.21.0
+
+Default: ``60.0``
+
+The longest interval, in seconds, that Scrapy enforces between requests
+because of ``robots.txt`` ``Crawl-delay`` or ``Request-rate`` directives when
+:setting:`ROBOTSTXT_OBEY_DELAY` is enabled.
+
+The value must be a non-negative, finite number; it is validated when the
+spider starts, and an invalid value raises :exc:`ValueError`. Intervals above
+this value are capped to it, logging a warning and incrementing the
+:stat:`robotstxt/delay_capped` stat once per ``robots.txt`` file. ``0``
+disables the robots.txt interval enforcement, like leaving
+:setting:`ROBOTSTXT_OBEY_DELAY` disabled.
+
 .. setting:: ROBOTSTXT_OBEY
 
 ROBOTSTXT_OBEY
@@ -2116,6 +2136,20 @@ If enabled, Scrapy will respect robots.txt policies. For more information see
     While the default value is ``False`` for historical reasons,
     this option is enabled by default in settings.py file generated
     by ``scrapy startproject`` command.
+
+.. setting:: ROBOTSTXT_OBEY_DELAY
+
+ROBOTSTXT_OBEY_DELAY
+--------------------
+
+.. versionadded:: 2.21.0
+
+Default: ``False``
+
+If enabled, and :setting:`ROBOTSTXT_OBEY` is also enabled, Scrapy enforces the
+``Crawl-delay`` and ``Request-rate`` directives of each ``robots.txt`` file as
+a minimum interval between the starts of the requests that it governs. For
+more information see :ref:`topics-dlmw-robots`.
 
 .. setting:: ROBOTSTXT_PARSER
 

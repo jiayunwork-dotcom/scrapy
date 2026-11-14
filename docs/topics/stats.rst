@@ -705,6 +705,26 @@ one per actual value of the placeholder.
     custom *stats_base_key*, in which case ``retry`` is replaced with that key
     in the 3 stats above.
 
+.. stat:: robotstxt/delay_capped
+
+``robotstxt/delay_capped``
+    Number of ``robots.txt`` files whose requested interval was capped at
+    :setting:`ROBOTSTXT_MAX_DELAY`. Each file counts at most once.
+
+    Set by
+    :class:`~scrapy.downloadermiddlewares.robotstxt.RobotsTxtMiddleware` when
+    :setting:`ROBOTSTXT_OBEY_DELAY` is enabled.
+
+.. stat:: robotstxt/delayed_count
+
+``robotstxt/delayed_count``
+    Number of requests that waited for their ``robots.txt`` interval before
+    being sent.
+
+    Set by
+    :class:`~scrapy.core.downloader.Downloader` when
+    :setting:`ROBOTSTXT_OBEY_DELAY` is enabled.
+
 .. stat:: robotstxt/exception_count/{exception_type}
 
 ``robotstxt/exception_count/{exception_type}``

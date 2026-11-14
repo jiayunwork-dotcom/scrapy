@@ -149,10 +149,13 @@ The limit that matters, though, is the one the target website tolerates.
 Exceeding it gets you throttled, served errors or banned, all of which make the
 crawl slower than a lower concurrency would have been. To find that limit:
 
--   Read the :ref:`robots.txt <topics-dlmw-robots>` file of the website. Scrapy
-    does not act on its ``Crawl-delay`` and ``Request-rate`` directives, so when
-    they are present, translate them into :setting:`DOWNLOAD_DELAY` and
-    concurrency settings yourself.
+-   Read the :ref:`robots.txt <topics-dlmw-robots>` file of the website. With
+    :setting:`ROBOTSTXT_OBEY_DELAY` and :setting:`ROBOTSTXT_OBEY` enabled,
+    Scrapy enforces its ``Crawl-delay`` and ``Request-rate`` directives as a
+    minimum interval between requests to that website, capped at
+    :setting:`ROBOTSTXT_MAX_DELAY`. Keep that in mind when raising concurrency
+    or lowering :setting:`DOWNLOAD_DELAY`, since neither can make requests to
+    that website start faster than its directives allow.
 
 -   Check the traffic that the website already gets, using a service like
     `SimilarWeb`_ or `Cloudflare Radar`_. A rate that is a rounding error next

@@ -9,6 +9,10 @@ from twisted.internet.defer import CancelledError, Deferred, DeferredList
 from twisted.python import failure
 
 from scrapy import Spider, signals
+from scrapy.core.downloader._robotsdelay import (
+    _ROBOTS_DELAY_META_KEY,
+    _ROBOTS_START_META_KEY,
+)
 from scrapy.downloadermiddlewares.robotstxt import RobotsTxtMiddleware
 from scrapy.exceptions import CannotResolveHostError, IgnoreRequest, NotConfigured
 from scrapy.http import Request, Response, TextResponse
@@ -359,6 +363,15 @@ Disallow: /some/randome/page.html
         assert robotsreq.meta["download_handler"] == "named"
         assert robotsreq.meta["is_robotstxt_request"] is True
 
+    @coroutine_test
+    async def test_robotstxt_download_counts_as_start(self) -> None:
+        crawler = self._get_successful_crawler()
+        crawler.settings.set("ROBOTSTXT_OBEY_DELAY", True)
+        middleware = RobotsTxtMiddleware(crawler)
+        await self.assertNotIgnored(Request("http://site.local/allowed"), middleware)
+        robotsreq = self.crawler.engine.download_async.call_args_list[0][0][0]
+        assert robotsreq.meta[_ROBOTS_START_META_KEY] == "site.local"
+
     async def assertNotIgnored(
         self, request: Request, middleware: RobotsTxtMiddleware
     ) -> None:
@@ -462,3 +475,144 @@ class TestRobotsTxtMiddlewareWithRerp(TestRobotsTxtMiddleware):
         self.crawler.settings.set(
             "ROBOTSTXT_PARSER", "scrapy.robotstxt.RerpRobotParser"
         )
+
+
+class _DelayParsers:
+    """RobotParser stand-ins returning fixed directive values."""
+
+    @staticmethod
+    def parser(crawl_delay=None, request_rate=None):
+        rp = mock.MagicMock()
+        rp.allowed.return_value = True
+        rp.crawl_delay.return_value = crawl_delay
+        rp.request_rate.return_value = request_rate
+        return rp
+
+
+class _DelayedSpider(Spider):
+    name = "delayed"
+
+    def parse(self, response: Response) -> None:
+        pass
+
+
+def _delay_middleware(
+    settings: dict[str, Any] | None = None, *, parser: Any = None
+) -> tuple[RobotsTxtMiddleware, Any]:
+    crawler = get_crawler(
+        _DelayedSpider,
+        {
+            "ROBOTSTXT_OBEY": True,
+            "ROBOTSTXT_OBEY_DELAY": True,
+            **(settings or {}),
+        },
+    )
+    crawler.spider = crawler._create_spider()
+    middleware = build_from_crawler(RobotsTxtMiddleware, crawler)
+    middleware._parserimpl = parser or (lambda *args: None)  # type: ignore[assignment]
+    return middleware, crawler
+
+
+@pytest.mark.parametrize(
+    ("crawl_delay", "request_rate", "expected"),
+    [
+        (None, None, None),
+        (0.0, None, None),
+        (1.5, None, 1.5),
+        (None, (2, 4.0), 2.0),
+        (None, (4, 2.0), 0.5),
+        (1.5, (2, 4.0), 2.0),
+        (3.0, (2, 4.0), 3.0),
+        (None, (0, 4.0), None),
+        (None, (2, 0.0), None),
+        (-1.0, None, None),
+        (float("nan"), None, None),
+        (float("inf"), None, None),
+    ],
+)
+def test_min_delay(
+    crawl_delay: float | None,
+    request_rate: tuple[int, float] | None,
+    expected: float | None,
+) -> None:
+    middleware, _ = _delay_middleware()
+    rp = _DelayParsers.parser(crawl_delay, request_rate)
+    request = Request("http://site.local/page")
+    useragent = middleware._default_useragent
+    assert middleware._min_delay(rp, useragent, "site.local") == (expected or 0.0)
+    if expected is None:
+        middleware.process_request_2(rp, request)
+        assert _ROBOTS_DELAY_META_KEY not in request.meta
+    else:
+        middleware.process_request_2(rp, request)
+        assert request.meta[_ROBOTS_DELAY_META_KEY] == ("site.local", expected)
+
+
+def test_min_delay_max_delay_cap_and_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    middleware, crawler = _delay_middleware({"ROBOTSTXT_MAX_DELAY": 2.0})
+    rp = _DelayParsers.parser(crawl_delay=10.0)
+    request = Request("http://site.local/page")
+    middleware.process_request_2(rp, request)
+    assert request.meta[_ROBOTS_DELAY_META_KEY] == ("site.local", 2.0)
+    assert crawler.stats
+    assert crawler.stats.get_value("robotstxt/delay_capped") == 1
+    assert "ROBOTSTXT_MAX_DELAY" in caplog.text
+    # Capping is tracked once per robots.txt file.
+    middleware.process_request_2(rp, Request("http://site.local/other"))
+    assert crawler.stats.get_value("robotstxt/delay_capped") == 1
+
+
+def test_min_delay_zero_max_delay_disables_throttle() -> None:
+    middleware, crawler = _delay_middleware({"ROBOTSTXT_MAX_DELAY": 0})
+    rp = _DelayParsers.parser(crawl_delay=10.0)
+    request = Request("http://site.local/page")
+    middleware.process_request_2(rp, request)
+    # A cap of 0 means no minimum interval, so the request is not throttled.
+    assert _ROBOTS_DELAY_META_KEY not in request.meta
+    assert crawler.stats
+    assert crawler.stats.get_value("robotstxt/delay_capped") == 1
+
+
+def test_min_delay_no_parser() -> None:
+    middleware, _ = _delay_middleware()
+    request = Request("http://site.local/page")
+    middleware.process_request_2(None, request)
+    assert _ROBOTS_DELAY_META_KEY not in request.meta
+
+
+@pytest.mark.parametrize(
+    "value",
+    [-1, -0.5, float("nan"), float("inf"), float("-inf"), True, False, "5", None],
+)
+def test_max_delay_invalid_value(value: Any) -> None:
+    crawler = get_crawler(
+        _DelayedSpider, {"ROBOTSTXT_OBEY": True, "ROBOTSTXT_MAX_DELAY": value}
+    )
+    with pytest.raises(ValueError, match="ROBOTSTXT_MAX_DELAY"):
+        build_from_crawler(RobotsTxtMiddleware, crawler)
+
+
+@pytest.mark.parametrize("value", [0, 1, 2.5, 60.0])
+def test_max_delay_valid_value(value: Any) -> None:
+    crawler = get_crawler(
+        _DelayedSpider, {"ROBOTSTXT_OBEY": True, "ROBOTSTXT_MAX_DELAY": value}
+    )
+    build_from_crawler(RobotsTxtMiddleware, crawler)
+
+
+def test_obey_delay_disabled_by_default() -> None:
+    middleware, _ = _delay_middleware({"ROBOTSTXT_OBEY_DELAY": False})
+    rp = _DelayParsers.parser(crawl_delay=5.0)
+    request = Request("http://site.local/page")
+    middleware.process_request_2(rp, request)
+    assert _ROBOTS_DELAY_META_KEY not in request.meta
+
+
+def test_obey_delay_needs_obey() -> None:
+    crawler = get_crawler(
+        _DelayedSpider, {"ROBOTSTXT_OBEY": False, "ROBOTSTXT_OBEY_DELAY": True}
+    )
+    with pytest.raises(NotConfigured):
+        build_from_crawler(RobotsTxtMiddleware, crawler)
