@@ -104,7 +104,10 @@ Pause limitations
 Job pausing and resuming is only supported when the spider is paused by
 stopping it cleanly. Forced, sudden or otherwise unclean shutdown can lead to
 data corruption in the job directory, which may prevent the spider from
-resuming correctly.
+resuming correctly. In-flight request recovery
+(:ref:`inflight-request-recovery`) covers hard process termination on a healthy
+machine, such as ``SIGKILL``, but neither it nor the rest of job persistence is
+designed to survive disk hardware failure or loss of power.
 
 Scrapy version changes
 ----------------------
@@ -157,6 +160,134 @@ It is ``False`` by default.
     not reflected in the original object. Keep this in mind if you rely on
     sharing mutable state through ``cb_kwargs`` or ``meta``.
 
+.. _inflight-request-recovery:
+
+In-flight request recovery
+==========================
+
+With :setting:`JOBDIR` alone, only the requests that are still stored in the
+scheduler queues survive an unclean shutdown: once the scheduler hands a
+request to the engine, nothing on disk remembers it anymore. If the process is
+killed while that request is being downloaded, while its callback is running,
+or while its items are still going through the item pipelines, the request is
+lost, and resubmitting its URL is blocked by the dupefilter.
+
+Setting :setting:`JOBDIR_TRACK_INFLIGHT` to ``True`` additionally persists
+every request from the moment it leaves the scheduler until its processing
+reaches its completion boundary. A process killed at any point in between
+re-schedules the request the next time the same job directory is opened.
+
+Supported configuration
+-----------------------
+
+The first version of this feature is meant for a single spider process, on a
+single machine, using one job directory with the same Scrapy version and the
+same spider code and settings on every run. It only works with:
+
+-   the default :class:`~scrapy.core.scheduler.Scheduler`,
+
+-   :class:`~scrapy.pqueues.ScrapyPriorityQueue` as
+    :setting:`SCHEDULER_PRIORITY_QUEUE`,
+
+-   :class:`~scrapy.squeues.PickleLifoSQLiteQueue` as
+    :setting:`SCHEDULER_DISK_QUEUE` and
+    :class:`~scrapy.squeues.PickleFifoSQLiteQueue` as
+    :setting:`SCHEDULER_START_DISK_QUEUE`,
+
+-   :class:`~scrapy.dupefilters.DiskDupeFilter` as
+    :setting:`DUPEFILTER_CLASS`,
+
+-   :setting:`JOBDIR_SYNC_EVERY` set to ``1``.
+
+If any of these conditions is not met, or :setting:`JOBDIR` is not set, the
+crawl raises an error before it starts instead of silently degrading. A job
+directory that still contains in-flight records from a previous run cannot be
+opened with :setting:`JOBDIR_TRACK_INFLIGHT` disabled.
+
+An old job directory that has no in-flight records yet can be opened with
+tracking enabled, and its existing pending request queue is reused as is.
+
+Completion boundary
+-------------------
+
+A request stops being recoverable only after its processing is fully done:
+the output of its callback or errback has been consumed, every new request it
+produced went through the normal scheduling acceptance or rejection flow, and
+every item it produced finished going through the item pipelines. Merely
+receiving the response, or getting a generator back from the callback before
+it is consumed, does not complete the request.
+
+Callback exceptions, final download failures,
+:exc:`~scrapy.exceptions.DropItem` and pipeline exceptions keep Scrapy's
+existing logging, signals and crawl termination semantics; these normal
+endings do not trigger extra retries, and once they are handled the request
+is no longer recovered.
+
+Requests are the recovery unit, never request fingerprints: two identical
+requests with :attr:`~scrapy.Request.dont_filter` set that are in flight at the
+same time are recovered independently, and acknowledging one does not
+acknowledge the other. Recovery preserves the method, URL, body, headers,
+cookies, ``meta``, ``cb_kwargs``, callback, errback, priority and
+``dont_filter`` of each request. The dupefilter is bypassed for the one
+re-scheduling of a recovered request without changing its ``dont_filter``
+value, so a later, newly submitted request with the same URL is still filtered
+as a duplicate.
+
+Replacement requests
+--------------------
+
+Requests produced by downloader middlewares, such as redirects and
+:class:`~scrapy.downloadermiddlewares.retry.RetryMiddleware` retries, are
+covered as well. If the process is killed at the boundary where the original
+request has ended and its replacement request is being enqueued, at least one
+side of that chain survives and continues the crawl on restart. Ordinary child
+requests yielded from a callback remain independently scheduled and
+deduplicated.
+
+Inline downloads made by directly awaiting a
+:class:`~scrapy.Request` or through
+:meth:`~scrapy.core.engine.ExecutionEngine.download_async` are recovered
+through the outer scheduled request they belong to. Standalone inline
+downloads with no outer scheduled request, e.g. those made from
+:meth:`~scrapy.Spider.start`, are not covered.
+
+Shutdown behavior
+-----------------
+
+During a graceful shutdown, requests that finish while the spider is closing
+are acknowledged normally. During a fast shutdown, the in-flight downloads that
+are dropped keep their recovery records and are re-scheduled on the next
+start, while the fast shutdown itself still drops the downloads immediately
+instead of waiting for the network. Requests that remain unfinished for any
+other closing or cancellation reason keep their recovery responsibility as
+well.
+
+At-least-once delivery
+----------------------
+
+Recovery follows at-least-once semantics. If the process exits after the
+output of a request happened but before the completion confirmation reached
+disk, the request is processed again on restart, which may produce the same
+items more than once. Scrapy does not provide exactly-once guarantees for
+external writes: item pipelines and their downstream systems must handle
+duplicate items themselves.
+
+Only requests that follow Scrapy's existing request serialization rules are
+accepted. A request that cannot be serialized is rejected when it is scheduled,
+with the reason logged, rather than being reported as enqueued while only held
+in memory. A failure to write or confirm in-flight records ends the crawl with
+an error and leaves the records on disk for diagnosis, instead of treating the
+request as safely stored or acknowledged.
+
+The in-flight records are removed as requests complete, so both their disk
+footprint and their in-memory state scale with the number of pending and
+in-flight requests rather than with the whole completed crawl history.
+
+.. warning:: This feature protects against hard process termination on a
+    healthy local machine, such as ``SIGKILL``. It does not cover disk
+    hardware failure or loss of power, which can leave partially written files
+    regardless of application-level synchronization.
+
 .. _job-dir-contents:
 
 Job directory contents
@@ -178,6 +309,7 @@ For example, with default settings, the job directory may look like this:
     |       └── {priority}{s?}
     |           ├── q{00000}
     |           └── info.json
+    ├── requests.inflight.db
     ├── requests.seen
     └── spider.state
 
@@ -201,6 +333,10 @@ Where:
 
 -   :class:`~scrapy.dupefilters.RFPDupeFilter` creates the ``requests.seen``
     file.
+
+-   The in-flight request recovery described in
+    :ref:`inflight-request-recovery` creates the ``requests.inflight.db``
+    SQLite database when :setting:`JOBDIR_TRACK_INFLIGHT` is enabled.
 
 -   :class:`~scrapy.extensions.spiderstate.SpiderState` creates the
     ``spider.state`` file.

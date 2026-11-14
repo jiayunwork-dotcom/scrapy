@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import pickle
+import sqlite3
 from abc import abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self, cast
@@ -9,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Self, cast
 # working around https://github.com/sphinx-doc/sphinx/issues/10400
 from twisted.internet.defer import Deferred  # noqa: TC002
 
+from scrapy.core.inflight import _InflightRequestStore
 from scrapy.spiders import Spider  # noqa: TC001
 from scrapy.utils.conf import _job_dir
 from scrapy.utils.misc import build_from_crawler, load_object
@@ -24,6 +27,16 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# Components that in-flight request recovery relies on.
+_TRACK_INFLIGHT_SETTINGS = {
+    "SCHEDULER": "scrapy.core.scheduler.Scheduler",
+    "SCHEDULER_PRIORITY_QUEUE": "scrapy.pqueues.ScrapyPriorityQueue",
+    "SCHEDULER_DISK_QUEUE": "scrapy.squeues.PickleLifoSQLiteQueue",
+    "SCHEDULER_START_DISK_QUEUE": "scrapy.squeues.PickleFifoSQLiteQueue",
+    "DUPEFILTER_CLASS": "scrapy.dupefilters.DiskDupeFilter",
+}
+_INFLIGHT_DB_NAME = "requests.inflight.db"
 
 
 class BaseSchedulerMeta(type):
@@ -70,6 +83,27 @@ class BaseScheduler(metaclass=BaseSchedulerMeta):
 
     .. versionadded:: 2.20.0
     """
+
+    supports_inflight_tracking: bool = False
+    """Whether the scheduler can persist in-flight requests when
+    :setting:`JOBDIR_TRACK_INFLIGHT` is enabled.
+
+    Subclasses that provide their own persistence must set it themselves.
+    """
+
+    def track_inflight(self, request: Request) -> None:
+        """Persist *request* so it can be scheduled again if the process is
+        killed before its processing completes.
+
+        Only called when :attr:`supports_inflight_tracking` is ``True``.
+        """
+
+    def ack_inflight(self, request: Request) -> None:
+        """Remove the persisted record of *request* once its processing
+        reaches its completion boundary.
+
+        Only called when :attr:`supports_inflight_tracking` is ``True``.
+        """
 
     @classmethod
     def from_crawler(cls, crawler: Crawler) -> Self:
@@ -263,11 +297,17 @@ class Scheduler(BaseScheduler):
         directory, directly or though instances of
         :setting:`SCHEDULER_DISK_QUEUE`.
 
+    -   With :setting:`JOBDIR_TRACK_INFLIGHT`, additionally creates a
+        ``requests.inflight.db`` SQLite database holding the requests that
+        left the scheduler but did not finish processing yet, so they can be
+        re-scheduled after an unclean shutdown.
+
     This scheduler class also uses the configured :setting:`DUPEFILTER_CLASS`,
     which may also write data inside the job directory.
     """
 
     supports_skip_dupefilter_once = True
+    supports_inflight_tracking = True
 
     @classmethod
     def from_crawler(cls, crawler: Crawler) -> Self:
@@ -341,12 +381,65 @@ class Scheduler(BaseScheduler):
         self._sync_every: int = (
             crawler.settings.getint("JOBDIR_SYNC_EVERY") if crawler else 0
         )
+        self._track_inflight: bool = (
+            crawler.settings.getbool("JOBDIR_TRACK_INFLIGHT") if crawler else False
+        )
+        self._inflight: _InflightRequestStore | None = None
         self._sdqclass: type[BaseQueue] | None = self._get_start_queue_cls(
             crawler, "DISK"
         )
         self._smqclass: type[BaseQueue] | None = self._get_start_queue_cls(
             crawler, "MEMORY"
         )
+
+    def _check_inflight_settings(self) -> None:
+        """Fail before the crawl starts rather than silently degrading when
+        in-flight tracking is enabled without the components it relies on."""
+        assert self.crawler is not None
+        settings = self.crawler.settings
+        if not self.dqdir:
+            raise RuntimeError(
+                "JOBDIR_TRACK_INFLIGHT requires the JOBDIR setting to be set"
+            )
+        mismatches = [
+            f"{name}={settings[name]!r}, expected {expected!r}"
+            for name, expected in _TRACK_INFLIGHT_SETTINGS.items()
+            if settings[name] != expected
+        ]
+        if self._sync_every != 1:
+            mismatches.append(f"JOBDIR_SYNC_EVERY={self._sync_every!r}, expected 1")
+        if mismatches:
+            raise RuntimeError(
+                "JOBDIR_TRACK_INFLIGHT only supports the default scheduler"
+                " setup with the SQLite request queues, the DiskDupeFilter"
+                " dupefilter and JOBDIR_SYNC_EVERY=1. Unsupported"
+                f" configuration: {'; '.join(mismatches)}"
+            )
+
+    @staticmethod
+    def _raise_inflight_disabled() -> None:
+        raise RuntimeError(
+            "The job directory holds in-flight requests written by a run with"
+            " JOBDIR_TRACK_INFLIGHT enabled, but JOBDIR_TRACK_INFLIGHT is"
+            " disabled. Re-enable it to recover those requests, or use a new"
+            " job directory to start a new job."
+        )
+
+    def _has_inflight_records(self) -> bool:
+        if not self.dqdir:
+            return False
+        db_path = Path(self.dqdir).parent / _INFLIGHT_DB_NAME
+        if not db_path.exists():
+            return False
+        db = sqlite3.connect(db_path)
+        try:
+            return bool(db.execute("SELECT 1 FROM inflight LIMIT 1").fetchone())
+        except sqlite3.DatabaseError:
+            # A database written by a different Scrapy version is outside the
+            # supported single-version resume scenario.
+            return False
+        finally:
+            db.close()
 
     def _get_start_queue_cls(
         self, crawler: Crawler | None, queue: str
@@ -368,10 +461,24 @@ class Scheduler(BaseScheduler):
         (3) return the result of the dupefilter's ``open`` method
         """
         self.spider: Spider = spider
+        if self._track_inflight:
+            try:
+                self._check_inflight_settings()
+            except Exception:
+                # Components such as the dupefilter may already hold open
+                # files; release them before surfacing the configuration error.
+                self.df.close("failed")
+                raise
+            assert self.dqdir is not None
+            self._inflight = _InflightRequestStore(Path(self.dqdir).parent, spider)
+        elif self._has_inflight_records():
+            self._raise_inflight_disabled()
         self.mqs: PriorityQueueProtocol = self._mq()
         self.dqs: PriorityQueueProtocol | None = self._dq() if self.dqdir else None
         self._dqs_changes = 0
         self._sync_dqs_state()
+        if self._inflight is not None:
+            self._recover_inflight()
         return self.df.open()
 
     def close(self, reason: str) -> Deferred[None] | None:
@@ -383,7 +490,39 @@ class Scheduler(BaseScheduler):
             state = self.dqs.close()
             assert isinstance(self.dqdir, str)
             self._write_dqs_state(self.dqdir, state)
+        if self._inflight is not None:
+            self._inflight.close()
+            self._inflight = None
         return self.df.close(reason)
+
+    def _recover_inflight(self) -> None:
+        """Re-enqueue the requests that were in flight when the previous
+        process died and drop their in-flight rows; the requests get new rows
+        when they leave the scheduler again."""
+        assert self._inflight is not None
+        assert self.stats is not None
+        recovered = 0
+        for row_id, request in self._inflight.recover():
+            # Re-scheduling goes through the regular enqueue path, so the
+            # request keeps its priority and order and bypasses the dupefilter
+            # only for this one scheduling, without changing dont_filter.
+            request.meta["skip_dupefilter_once"] = True
+            if not self.enqueue_request(request):
+                # The dupefilter is bypassed above; a rejection here means the
+                # request can no longer be stored, so losing it silently is not
+                # an option.
+                raise RuntimeError(
+                    f"Could not re-enqueue recovered in-flight request {request}"
+                )
+            self._inflight.discard_recovered(row_id)
+            recovered += 1
+        if recovered:
+            logger.info(
+                "Resuming %(count)d in-flight request%(plural)s from the job directory",
+                {"count": recovered, "plural": "" if recovered == 1 else "s"},
+                extra={"spider": self.spider},
+            )
+            self.stats.inc_value("scheduler/inflight/recovered", recovered)
 
     def enqueue_request(self, request: Request) -> bool:
         """
@@ -407,6 +546,18 @@ class Scheduler(BaseScheduler):
         assert self.stats is not None
         if dqok:
             self.stats.inc_value("scheduler/enqueued/disk")
+        elif self._track_inflight:
+            # In-flight recovery only accepts requests that the disk queues can
+            # serialize, so an in-memory fallback would be lost on the next
+            # kill. Reject the request instead of pretending it is safe.
+            logger.error(
+                "Rejected unserializable request with JOBDIR_TRACK_INFLIGHT"
+                " enabled: %(request)s",
+                {"request": request},
+                extra={"spider": self.spider},
+            )
+            self.stats.inc_value("scheduler/inflight/unserializable")
+            return False
         else:
             self._mqpush(request)
             self.stats.inc_value("scheduler/enqueued/memory")
@@ -434,8 +585,57 @@ class Scheduler(BaseScheduler):
             if request is not None:
                 self.stats.inc_value("scheduler/dequeued/disk")
         if request is not None:
+            self.track_inflight(request)
             self.stats.inc_value("scheduler/dequeued")
         return request
+
+    def track_inflight(self, request: Request) -> None:
+        """Write *request* to the in-flight storage before it leaves the
+        scheduler, so that a kill at any point during its download, callback or
+        item pipeline processing can be recovered from the job directory."""
+        if self._inflight is None:
+            return
+        try:
+            data = pickle.dumps(request.to_dict(spider=self.spider), protocol=4)
+            self._inflight.add(request, data)
+        except (pickle.PicklingError, AttributeError, TypeError, ValueError) as exc:
+            # The request passed the disk queue serialization on its way in,
+            # so this only happens for storage failures, which must end the
+            # crawl with an error instead of letting the request disappear.
+            self._fail_inflight(f"Failed to persist in-flight request {request}: {exc}")
+            return
+        assert self.stats is not None
+        self.stats.inc_value("scheduler/inflight/tracked")
+
+    def ack_inflight(self, request: Request) -> None:
+        """Confirm that the processing of *request* reached its completion
+        boundary, so that later restarts no longer recover it."""
+        if self._inflight is None:
+            return
+        try:
+            self._inflight.ack(request)
+        except sqlite3.DatabaseError as exc:
+            self._fail_inflight(
+                f"Failed to confirm the completion of in-flight request"
+                f" {request}: {exc}"
+            )
+            return
+        assert self.stats is not None
+        self.stats.inc_value("scheduler/inflight/acknowledged")
+
+    def _fail_inflight(self, message: str) -> None:
+        """Log the persistence failure and stop the crawl with an error, so a
+        request is neither treated as safely stored nor as acknowledged."""
+        logger.error(message, extra={"spider": self.spider})
+        assert self.crawler is not None
+        assert self.crawler.engine is not None
+        from scrapy.utils.defer import _schedule_coro  # noqa: PLC0415
+
+        _schedule_coro(
+            self.crawler.engine.close_spider_async(
+                reason="inflight_storage_error", error=True
+            )
+        )
 
     def __len__(self) -> int:
         """

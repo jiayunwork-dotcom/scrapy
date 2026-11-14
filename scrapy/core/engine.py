@@ -578,11 +578,14 @@ class ExecutionEngine:
                 asyncio.exceptions.CancelledError,
             )
         ):
+            # Fast shutdown drops the download without processing it, so the
+            # request stays recoverable in the scheduler's in-flight storage.
             return
 
         # downloader middleware can return requests (for example, redirects)
         if isinstance(result, Request):
             self.crawl(result)
+            self._ack_inflight(request)
             return
 
         try:
@@ -592,6 +595,20 @@ class ExecutionEngine:
             logger.exception(
                 "Error while enqueuing scrape", extra={"spider": self.spider}
             )
+            # The request never reached the scraper, so its processing did not
+            # reach the completion boundary: leave it to be recovered.
+            return
+        # The callback or errback output has been fully consumed, including
+        # every item pipeline call and the scheduling of the requests it
+        # produced.
+        self._ack_inflight(request)
+
+    def _ack_inflight(self, request: Request) -> None:
+        if self._slot is None:
+            return
+        scheduler = self._slot.scheduler
+        if getattr(scheduler, "supports_inflight_tracking", False):
+            scheduler.ack_inflight(request)
 
     def spider_is_idle(self) -> bool:
         if self._slot is None:

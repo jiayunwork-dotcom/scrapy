@@ -1737,6 +1737,36 @@ requires the SQLite types of :setting:`SCHEDULER_DISK_QUEUE` and
 :setting:`SCHEDULER_START_DISK_QUEUE`.
 
 
+.. setting:: JOBDIR_TRACK_INFLIGHT
+
+JOBDIR_TRACK_INFLIGHT
+---------------------
+
+.. versionadded:: 2.20.0
+
+Default: ``False``
+
+Whether requests that have left the scheduler but did not finish processing
+yet are also persisted in the :setting:`JOBDIR` directory, so that a process
+killed with ``SIGKILL`` (or an equivalent hard termination) can resume them on
+the next start with the same job directory. See
+:ref:`inflight-request-recovery` for the supported configuration, the
+completion boundary and the at-least-once implications.
+
+When enabled, this setting requires :setting:`JOBDIR` and
+:setting:`JOBDIR_SYNC_EVERY` set to ``1``, the default
+:class:`~scrapy.core.scheduler.Scheduler` and
+:class:`~scrapy.pqueues.ScrapyPriorityQueue`, the SQLite request queues
+(:class:`~scrapy.squeues.PickleLifoSQLiteQueue` and
+:class:`~scrapy.squeues.PickleFifoSQLiteQueue`) and
+:class:`~scrapy.dupefilters.DiskDupeFilter`. Starting a crawl with any other
+component raises an error before the crawl starts.
+
+Requests that cannot be serialized are rejected instead of kept in memory,
+where a kill would lose them. A job directory that still holds in-flight
+records from a previous run cannot be opened with this setting disabled.
+
+
 .. setting:: LOG_COLOR
 
 LOG_COLOR
