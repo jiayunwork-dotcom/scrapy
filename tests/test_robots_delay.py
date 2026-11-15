@@ -6,15 +6,19 @@ than exact moments, so that the tests do not depend on scheduler precision.
 
 from __future__ import annotations
 
-import asyncio
+from itertools import pairwise
 from time import monotonic
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from scrapy import Request, Spider
 from scrapy.http import Response
 from scrapy.utils.asyncio import sleep
+from scrapy.utils.defer import deferred_from_coro, maybe_deferred_to_future
 from scrapy.utils.test import get_crawler
 from tests.utils.decorators import coroutine_test
+
+if TYPE_CHECKING:
+    import pytest
 
 TOLERANCE = 0.01
 
@@ -110,7 +114,7 @@ class _SiteSpider(Spider):
 
 
 def _gaps(times: list[float]) -> list[float]:
-    return [later - earlier for earlier, later in zip(times, times[1:])]
+    return [later - earlier for earlier, later in pairwise(times)]
 
 
 def _assert_interval(times: list[float], interval: float) -> None:
@@ -582,13 +586,15 @@ async def test_close_does_not_wait_for_intervals(
         await sleep(0.3)
         await crawler.stop_async()
 
-    stop_task = asyncio.ensure_future(stop_soon())
+    # A Deferred drives the background stop on the plain Twisted reactor as
+    # well as on an asyncio loop.
+    stop_task = deferred_from_coro(stop_soon())
     try:
         start = monotonic()
         await crawler.crawl_async(urls=[f"http://a.example/{i}" for i in range(5)])
         elapsed = monotonic() - start
     finally:
-        await stop_task
+        await maybe_deferred_to_future(stop_task)
     assert elapsed < 1.0
     # Only the robots.txt download and at most the granted request started.
     assert len(_RecordingHandler.start_times()) <= 1

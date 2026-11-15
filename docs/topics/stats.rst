@@ -719,7 +719,9 @@ one per actual value of the placeholder.
 
 ``robotstxt/delayed_count``
     Number of requests that waited for their ``robots.txt`` interval before
-    being sent.
+    being sent. A request that waits more than once, e.g. because a later
+    request of the same file overtook it while it was queued in a download
+    slot, is still counted once.
 
     Set by
     :class:`~scrapy.core.downloader.Downloader` when

@@ -516,36 +516,35 @@ def _delay_middleware(
 @pytest.mark.parametrize(
     ("crawl_delay", "request_rate", "expected"),
     [
-        (None, None, None),
-        (0.0, None, None),
+        # A zero interval is still stamped: the request does not wait, but its
+        # start counts toward the interval of later requests of the same
+        # robots.txt file, including requests of another user agent.
+        (None, None, 0.0),
+        (0.0, None, 0.0),
         (1.5, None, 1.5),
         (None, (2, 4.0), 2.0),
         (None, (4, 2.0), 0.5),
         (1.5, (2, 4.0), 2.0),
         (3.0, (2, 4.0), 3.0),
-        (None, (0, 4.0), None),
-        (None, (2, 0.0), None),
-        (-1.0, None, None),
-        (float("nan"), None, None),
-        (float("inf"), None, None),
+        (None, (0, 4.0), 0.0),
+        (None, (2, 0.0), 0.0),
+        (-1.0, None, 0.0),
+        (float("nan"), None, 0.0),
+        (float("inf"), None, 0.0),
     ],
 )
 def test_min_delay(
     crawl_delay: float | None,
     request_rate: tuple[int, float] | None,
-    expected: float | None,
+    expected: float,
 ) -> None:
     middleware, _ = _delay_middleware()
     rp = _DelayParsers.parser(crawl_delay, request_rate)
     request = Request("http://site.local/page")
     useragent = middleware._default_useragent
-    assert middleware._min_delay(rp, useragent, "site.local") == (expected or 0.0)
-    if expected is None:
-        middleware.process_request_2(rp, request)
-        assert _ROBOTS_DELAY_META_KEY not in request.meta
-    else:
-        middleware.process_request_2(rp, request)
-        assert request.meta[_ROBOTS_DELAY_META_KEY] == ("site.local", expected)
+    assert middleware._min_delay(rp, useragent, "site.local") == expected
+    middleware.process_request_2(rp, request)
+    assert request.meta[_ROBOTS_DELAY_META_KEY] == ("site.local", expected)
 
 
 def test_min_delay_max_delay_cap_and_warning(
@@ -579,7 +578,9 @@ def test_min_delay_no_parser() -> None:
     middleware, _ = _delay_middleware()
     request = Request("http://site.local/page")
     middleware.process_request_2(None, request)
-    assert _ROBOTS_DELAY_META_KEY not in request.meta
+    # With no parser the interval is 0, but the request still records its
+    # start for later requests of the same robots.txt file.
+    assert request.meta[_ROBOTS_DELAY_META_KEY] == ("site.local", 0.0)
 
 
 @pytest.mark.parametrize(

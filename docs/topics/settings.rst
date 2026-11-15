@@ -2151,6 +2151,13 @@ If enabled, and :setting:`ROBOTSTXT_OBEY` is also enabled, Scrapy enforces the
 a minimum interval between the starts of the requests that it governs. For
 more information see :ref:`topics-dlmw-robots`.
 
+The interval is a per-``robots.txt`` floor on real starts, not a per-user-agent
+or per-slot one. A single file may assign different intervals to different user
+agents, including 0: a request with an interval of 0 does not wait, but its
+start still counts, so a later request with a positive interval is spaced from
+it. Requests of the same file are spaced independently of their download slot,
+and a request delayed in a slot rechecks the floor before it starts.
+
 .. setting:: ROBOTSTXT_PARSER
 
 ROBOTSTXT_PARSER

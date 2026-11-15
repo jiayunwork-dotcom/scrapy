@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from logging import getLogger
 from time import monotonic, perf_counter, time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from twisted.internet.defer import Deferred, DeferredList, inlineCallbacks
 
@@ -103,6 +103,15 @@ class Slot:
     transferring: set[Request] = field(default_factory=set, init=False, repr=False)
     lastseen: float = field(default=0, init=False, repr=False)
     latercall: CallLaterResult | None = field(default=None, init=False, repr=False)
+    # Requests queued here that still have to wait for their robots.txt
+    # interval, and the timer that resumes the queue when the earliest of them
+    # may start.
+    robots_rewaiting: set[Request] = field(
+        default_factory=set, init=False, repr=False
+    )
+    robots_call: CallLaterResult | None = field(
+        default=None, init=False, repr=False
+    )
     # Number of requests in queue not sent with
     # ExecutionEngine.download_async().
     _scheduled_queued: int = field(default=0, init=False, repr=False)
@@ -137,6 +146,8 @@ class Slot:
         self.transferring = set()
         self.lastseen = 0
         self.latercall = None
+        self.robots_rewaiting = set()
+        self.robots_call = None
         self._scheduled_queued = 0
 
     @property
@@ -170,6 +181,9 @@ class Slot:
         if self.latercall:
             self.latercall.cancel()
             self.latercall = None
+        if self.robots_call:
+            self.robots_call.cancel()
+            self.robots_call = None
 
     def __str__(self) -> str:
         return (
@@ -524,7 +538,7 @@ class Downloader:
             return None
         if request.url.startswith(("data:", "file:")):
             return None
-        return meta
+        return cast("tuple[str, float]", meta)
 
     async def _enqueue_robots_delayed(
         self, request: Request, robots: tuple[str, float]
@@ -550,11 +564,9 @@ class Downloader:
             raise DownloadCancelledError(
                 "The downloader is shutting down and not accepting new requests"
             )
-        # The request may start now. It gets a slot only at this point, so its
-        # wait did not hold a concurrency spot or count toward
-        # CONCURRENT_REQUESTS.
-        if waiter.waited:
-            self._stats.inc_value("robotstxt/delayed_count")
+        # The request may enter its slot now. Its interval may still be
+        # invalidated while it queues, which _process_queue() rechecks before
+        # the request reaches the download handler.
         return await self._enqueue_into_slot(request, robots_waiter=waiter)
 
     async def _enqueue_into_slot(
@@ -603,12 +615,33 @@ class Downloader:
                 slot.latercall = call_later(penalty, self._latercall, slot)
                 return
 
-        # Process enqueued requests if there are free slots to transfer for this slot
+        rewait = self._transfer_queued(slot, now, delay)
+        if rewait is not None:
+            self._schedule_robots_rewait(slot, rewait)
+
+    def _transfer_queued(self, slot: Slot, now: float, delay: float) -> float | None:
+        """Start every queued request that may transfer now. Return the
+        shortest robots.txt rewait among the requests left queued, or None."""
+        rewait: float | None = None
+        index = 0
         while slot.queue and slot.free_transfer_slots() > 0:
-            index = self._next_transfer_index(slot)
-            if index is None:
+            index, request = self._next_queue_entry(slot, index)
+            if request is None:
                 break
-            request, queue_dfd = slot.queue[index]
+            queue_dfd = self._queue_dfd(slot, index)
+            # A request released from its robots.txt wait may have been
+            # overtaken by a later request of the same site in another slot.
+            # Recheck its interval before it takes a transfer spot: leave it
+            # queued, without one, and look further down the queue instead of
+            # holding the slot back for other requests.
+            robots_wait = self._robots_rewait_seconds(slot, request)
+            if robots_wait is not None:
+                if rewait is None or robots_wait < rewait:
+                    rewait = robots_wait
+                index += 1
+                if index >= len(slot.queue):
+                    break
+                continue
             del slot.queue[index]
             slot.lastseen = now
             # Do this immediately so that following free_transfer_slots() calls
@@ -631,6 +664,25 @@ class Downloader:
             if delay:
                 self._process_queue(slot)
                 break
+        return rewait
+
+    def _next_queue_entry(
+        self, slot: Slot, index: int
+    ) -> tuple[int, Request | None]:
+        """Return the queue position to try and the request there, accounting
+        for requests that RESPONSE_MAX_ACTIVE_SIZE holds back. The request is
+        None when nothing at or after *index* may transfer."""
+        transfer_index = self._next_transfer_index(slot)
+        if transfer_index is None:
+            return index, None
+        # A size-held unscheduled request at the head is skipped: the first
+        # transferable one may sit further down the queue.
+        index = max(index, transfer_index)
+        return index, slot.queue[index][0]
+
+    @staticmethod
+    def _queue_dfd(slot: Slot, index: int) -> Deferred[Response]:
+        return slot.queue[index][1]
 
     def _download_task_done(self, result: Any, request: Request) -> Any:
         self._download_tasks.pop(request, None)
@@ -658,13 +710,55 @@ class Downloader:
         slot.latercall = None
         self._process_queue(slot)
 
+    def _robots_rewait_seconds(self, slot: Slot, request: Request) -> float | None:
+        """Return the time *request* still has to wait for its robots.txt
+        interval before reaching the download handler, or ``None`` if it may
+        start now.
+
+        A request whose interval was invalidated while it queued, e.g. by a
+        later request of the same site in another slot, stays in the slot
+        queue without taking a transfer spot, and the queue resumes once its
+        interval elapses.
+        """
+        if self._robots_throttle is None:
+            return None
+        waiter = self._robots_starters.get(request)
+        if waiter is None:
+            return None
+        wait = self._robots_throttle.check_start(waiter)
+        if wait <= 0:
+            return None
+        # The wait holds no transfer spot and must not count toward
+        # CONCURRENT_REQUESTS or RESPONSE_MAX_ACTIVE_SIZE.
+        if request not in slot.robots_rewaiting:
+            slot.robots_rewaiting.add(request)
+            self._robots_waiting += 1
+            self.middleware._discount_rough_size(request)
+        return wait
+
+    def _schedule_robots_rewait(self, slot: Slot, wait: float) -> None:
+        if slot.robots_call is not None:
+            return
+        slot.robots_call = call_later(wait, self._robots_rewait_done, slot)
+
+    def _robots_rewait_done(self, slot: Slot) -> None:
+        slot.robots_call = None
+        for request in slot.robots_rewaiting:
+            self._robots_waiting -= 1
+            self.middleware._count_rough_size(request)
+        slot.robots_rewaiting.clear()
+        self._process_queue(slot)
+
     async def _download(self, slot: Slot, request: Request) -> Response:
         # The order is very important for the following logic. Do not change!
         try:
             waiter = self._robots_starters.pop(request, None)
             if waiter is not None and self._robots_throttle is not None:
                 # This request is being handed to the download handler now,
-                # i.e. its start happens now.
+                # i.e. its start happens now. Count it as delayed at most once,
+                # whether the wait happened before the slot queue or inside it.
+                if waiter.waited:
+                    self._stats.inc_value("robotstxt/delayed_count")
                 self._robots_throttle.started(waiter)
             else:
                 self._record_robots_start(request)
@@ -844,6 +938,13 @@ class Downloader:
 
         for slot in self.slots.values():
             slot.close()
+            # Requests whose interval was rechecked inside the queue held no
+            # concurrency spot; reconcile their counters before draining.
+            if slot.robots_rewaiting:
+                self._robots_waiting -= len(slot.robots_rewaiting)
+                for request in slot.robots_rewaiting:
+                    self.middleware._count_rough_size(request)
+                slot.robots_rewaiting.clear()
             while slot.queue:
                 request, queue_dfd = slot.queue.popleft()
                 dropped_count += 1
