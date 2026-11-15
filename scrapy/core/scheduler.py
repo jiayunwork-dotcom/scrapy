@@ -4,6 +4,7 @@ import json
 import logging
 import pickle
 import sqlite3
+import uuid
 from abc import abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self, cast
@@ -37,6 +38,19 @@ _TRACK_INFLIGHT_SETTINGS = {
     "DUPEFILTER_CLASS": "scrapy.dupefilters.DiskDupeFilter",
 }
 _INFLIGHT_DB_NAME = "requests.inflight.db"
+# Scheduler-private meta key carrying the token that links the two persistent
+# copies of a request during the queue -> in-flight handoff. The key is added
+# when a request leaves the queue, stripped before the request is handed to the
+# engine, and never used for deduplication or fingerprints.
+_HANDOFF_TOKEN_META_KEY = "_scrapy_handoff_token"  # noqa: S105
+
+
+def _handoff_token_of(request: Request) -> str | None:
+    return request.meta.get(_HANDOFF_TOKEN_META_KEY)
+
+
+def _new_handoff_token() -> str:
+    return uuid.uuid4().hex
 
 
 class BaseSchedulerMeta(type):
@@ -401,11 +415,21 @@ class Scheduler(BaseScheduler):
             raise RuntimeError(
                 "JOBDIR_TRACK_INFLIGHT requires the JOBDIR setting to be set"
             )
-        mismatches = [
-            f"{name}={settings[name]!r}, expected {expected!r}"
-            for name, expected in _TRACK_INFLIGHT_SETTINGS.items()
-            if settings[name] != expected
-        ]
+        mismatches = []
+        for name, expected in _TRACK_INFLIGHT_SETTINGS.items():
+            value = settings[name]
+            if name == "SCHEDULER":
+                # A subclass that keeps the persistence contract (e.g. a
+                # testing scheduler) is acceptable, unlike a replacement
+                # scheduler with different queue behavior.
+                try:
+                    compatible = issubclass(load_object(value), load_object(expected))
+                except (TypeError, ImportError, AttributeError):
+                    compatible = False
+            else:
+                compatible = value == expected
+            if not compatible:
+                mismatches.append(f"{name}={value!r}, expected {expected!r}")
         if self._sync_every != 1:
             mismatches.append(f"JOBDIR_SYNC_EVERY={self._sync_every!r}, expected 1")
         if mismatches:
@@ -496,16 +520,32 @@ class Scheduler(BaseScheduler):
         return self.df.close(reason)
 
     def _recover_inflight(self) -> None:
-        """Re-enqueue the requests that were in flight when the previous
-        process died and drop their in-flight rows; the requests get new rows
-        when they leave the scheduler again."""
+        """Re-enqueue the requests that were in flight or in the middle of
+        the queue -> in-flight handoff when the previous process died.
+
+        A staged row whose handoff token still matches an entry in the request
+        queue means the queue removal never became durable: the queue copy is
+        the schedulable one and the duplicated in-flight row is discarded.
+        Rows without such a counterpart are the only surviving copy and are
+        re-enqueued through the regular path, bypassing the dupefilter for
+        this one scheduling without changing ``dont_filter``. Rows left by a
+        Scrapy version without the staging step (``handoff_token`` is ``None``)
+        are always re-enqueued, since they never had a queue counterpart.
+        """
         assert self._inflight is not None
         assert self.stats is not None
+        assert self.dqs is not None
+        pending_tokens = self.dqs.pending_handoff_tokens()
         recovered = 0
-        for row_id, request in self._inflight.recover():
-            # Re-scheduling goes through the regular enqueue path, so the
-            # request keeps its priority and order and bypasses the dupefilter
-            # only for this one scheduling, without changing dont_filter.
+        duplicates = 0
+        for row_id, request, handoff_token in self._inflight.recover():
+            if handoff_token is not None and handoff_token in pending_tokens:
+                # Both the queue entry and the staged row survived the kill.
+                # The queue entry keeps its place, priority and order; drop
+                # only the redundant staged copy so the instance stays single.
+                self._inflight.discard_recovered(row_id)
+                duplicates += 1
+                continue
             request.meta["skip_dupefilter_once"] = True
             if not self.enqueue_request(request):
                 # The dupefilter is bypassed above; a rejection here means the
@@ -516,6 +556,14 @@ class Scheduler(BaseScheduler):
                 )
             self._inflight.discard_recovered(row_id)
             recovered += 1
+        if duplicates:
+            logger.info(
+                "Discarded %(count)d duplicated in-flight record%(plural)s whose"
+                " request queue entry survived",
+                {"count": duplicates, "plural": "" if duplicates == 1 else "s"},
+                extra={"spider": self.spider},
+            )
+            self.stats.inc_value("scheduler/inflight/duplicated", duplicates)
         if recovered:
             logger.info(
                 "Resuming %(count)d in-flight request%(plural)s from the job directory",
@@ -542,6 +590,12 @@ class Scheduler(BaseScheduler):
         ):
             self.df.log(request, self.spider)
             return False
+        if self._track_inflight:
+            # The token links the queue entry and the in-flight row written
+            # when this request leaves the queue. It travels inside the
+            # serialized queue copy only and is stripped before the request
+            # reaches the engine, so it never affects fingerprints or callbacks.
+            request.meta.setdefault(_HANDOFF_TOKEN_META_KEY, _new_handoff_token())
         dqok = self._dqpush(request)
         assert self.stats is not None
         if dqok:
@@ -571,6 +625,10 @@ class Scheduler(BaseScheduler):
         preferring the memory queue on a tie. Return ``None`` if there are no
         more enqueued requests.
 
+        With in-flight tracking, a disk request is staged in the in-flight
+        database *before* its queue entry is removed, so a kill at any point
+        of the handoff leaves the request in at least one persistent store.
+
         Increment the appropriate stats, such as: :stat:`scheduler/dequeued`,
         :stat:`scheduler/dequeued/disk`, :stat:`scheduler/dequeued/memory`.
         """
@@ -580,24 +638,122 @@ class Scheduler(BaseScheduler):
             request = self.mqs.pop()
             if request is not None:
                 self.stats.inc_value("scheduler/dequeued/memory")
-        if request is None:
+        if request is None and self._track_inflight:
+            request = self._handoff_disk_request()
+            if request is not None:
+                self.stats.inc_value("scheduler/dequeued/disk")
+        elif request is None:
             request = self._dqpop()
             if request is not None:
                 self.stats.inc_value("scheduler/dequeued/disk")
         if request is not None:
-            self.track_inflight(request)
+            if not self._track_inflight:
+                self.track_inflight(request)
             self.stats.inc_value("scheduler/dequeued")
+        return request
+
+    def _handoff_disk_request(self) -> Request | None:
+        """Move the next disk request into the in-flight store without a
+        window in which neither persistent store holds it.
+
+        The in-flight row is written and committed while the queue entry still
+        exists, then the exact queue row is deleted. A kill before the staging
+        write leaves the queue entry intact; a kill afterwards leaves the
+        in-flight row, and recovery deduplicates the overlap if both survive.
+        Any persistence failure ends the crawl with an error instead of
+        returning a request that has no recovery guarantee.
+        """
+        assert self.dqs is not None
+        assert self._inflight is not None
+        try:
+            entry = self.dqs.peek_entry()
+        except (sqlite3.DatabaseError, OSError, pickle.PickleError) as exc:
+            self._fail_inflight(f"Failed to read the next queued request: {exc}")
+            return None
+        if entry is None:
+            return None
+        entry_id, queued_request = entry
+        token = _handoff_token_of(queued_request)
+        if token is None:
+            # Entries written by a Scrapy version without handoff tokens get
+            # theirs in place: the row id stays the same, so staging and
+            # removal below still refer to the same request instance.
+            token = _new_handoff_token()
+            queued_request.meta[_HANDOFF_TOKEN_META_KEY] = token
+            try:
+                stamped = self.dqs.stamp_entry(entry_id, queued_request)
+            except (sqlite3.DatabaseError, OSError, pickle.PickleError) as exc:
+                self._fail_inflight(
+                    f"Failed to mark queued request {queued_request} for the"
+                    f" in-flight handoff: {exc}"
+                )
+                return None
+            if not stamped:
+                # Another consumer already removed this row; its in-flight
+                # record is the surviving copy, so nothing is handed off here.
+                return None
+        try:
+            data = pickle.dumps(queued_request.to_dict(spider=self.spider), protocol=4)
+            self._inflight.stage(queued_request, data, token)
+        except (
+            pickle.PicklingError,
+            AttributeError,
+            TypeError,
+            ValueError,
+            sqlite3.DatabaseError,
+            OSError,
+        ) as exc:
+            self._fail_inflight(
+                f"Failed to persist in-flight request {queued_request}: {exc}"
+            )
+            return None
+        try:
+            request = self.dqs.pop_entry(entry_id)
+        except (sqlite3.DatabaseError, OSError, pickle.PickleError) as exc:
+            # The staging write is already durable. Whether the queue removal
+            # happened or not, the in-flight row now guarantees recovery, so
+            # surface the failure and let reconciliation prevent a duplicate
+            # instead of handing out an unrecoverable request.
+            self._fail_inflight(
+                f"Failed to remove the queued entry of in-flight request"
+                f" {queued_request}: {exc}"
+            )
+            return None
+        self._sync_dqs_state()
+        assert self.stats is not None
+        self.stats.inc_value("scheduler/inflight/tracked")
+        if request is None:
+            # The entry vanished between peek and pop. The staged in-flight row
+            # remains the single copy and is returned through recovery rather
+            # than handed out twice.
+            return None
+        # The pop deserialized the queue row into a new Request instance; make
+        # the in-flight row addressable through that instance for ack_inflight.
+        try:
+            self._inflight.claim(request, token)
+        except sqlite3.DatabaseError as exc:
+            self._fail_inflight(
+                f"Failed to link the in-flight record of request {request}: {exc}"
+            )
+            return None
+        request.meta.pop(_HANDOFF_TOKEN_META_KEY, None)
         return request
 
     def track_inflight(self, request: Request) -> None:
         """Write *request* to the in-flight storage before it leaves the
         scheduler, so that a kill at any point during its download, callback or
-        item pipeline processing can be recovered from the job directory."""
+        item pipeline processing can be recovered from the job directory.
+
+        Disk requests go through the crash-safe
+        :meth:`_handoff_disk_request` path instead; this method only covers
+        requests popped from memory queues, which the tracking setup does not
+        use but custom subclasses may still schedule.
+        """
         if self._inflight is None:
             return
         try:
             data = pickle.dumps(request.to_dict(spider=self.spider), protocol=4)
-            self._inflight.add(request, data)
+            self._inflight.stage(request, data, _new_handoff_token())
         except (pickle.PicklingError, AttributeError, TypeError, ValueError) as exc:
             # The request passed the disk queue serialization on its way in,
             # so this only happens for storage failures, which must end the

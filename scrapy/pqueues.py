@@ -81,6 +81,28 @@ class PriorityQueueProtocol(Protocol):
         is empty.
         """
 
+    def peek_entry(self) -> tuple[int, Request] | None:
+        """Remove nothing; return the id and the request that :meth:`pop`
+        would return next. Only required by the crash-safe in-flight handoff
+        and only implemented by the SQLite request queues.
+        """
+
+    def pop_entry(self, entry_id: int) -> Request | None:
+        """Remove the request stored under *entry_id*. Only required by the
+        crash-safe in-flight handoff and only implemented by the SQLite
+        request queues.
+        """
+
+    def stamp_entry(self, entry_id: int, request: Request) -> bool:
+        """Replace in place the request stored under *entry_id*, keeping its
+        id and position. Only used by the crash-safe in-flight handoff.
+        """
+
+    def pending_handoff_tokens(self) -> set[str]:
+        """Return the internal handoff tokens of every stored request. Only
+        used once when opening a job directory with in-flight tracking.
+        """
+
     def close(self) -> Any:
         """Close the queue and return a JSON-serializable state to pass as
         *startprios* to :meth:`from_crawler` when resuming the job.
@@ -254,6 +276,53 @@ class ScrapyPriorityQueue:
         if not q:
             self._update_curprio()
         return request
+
+    def peek_entry(self) -> tuple[int, Request] | None:
+        """Return the queue entry id and the request that :meth:`pop` would
+        return next, without removing anything. Only available for the SQLite
+        request queues used by the crash-safe scheduler handoff."""
+        if self.curprio is None:
+            return None
+        q = self._curqueue()
+        return q.peek_entry()  # type: ignore[attr-defined,no-any-return]
+
+    def pop_entry(self, entry_id: int) -> Request | None:
+        """Remove the request stored under *entry_id* in the current queue.
+
+        Returns ``None`` if the entry was already consumed, in which case the
+        empty-queue bookkeeping is still refreshed exactly as for :meth:`pop`.
+        """
+        if self.curprio is None:
+            return None
+        q = self._curqueue()
+        request: Request | None = q.pop_entry(entry_id)  # type: ignore[attr-defined]
+        if not q:
+            self._update_curprio()
+        return request
+
+    def stamp_entry(self, entry_id: int, request: Request) -> bool:
+        """Replace the request stored under *entry_id* in the current queue,
+        keeping its row id and its position."""
+        if self.curprio is None:
+            return False
+        q = self._curqueue()
+        return q.stamp_entry(entry_id, request)  # type: ignore[attr-defined,no-any-return]
+
+    def pending_handoff_tokens(self) -> set[str]:
+        """Return the handoff tokens of every request still stored in the
+        queues. Used once when opening the job directory to tell in-flight
+        rows whose queue counterpart survived a kill apart from rows that are
+        the only surviving copy."""
+        from scrapy.core.scheduler import _handoff_token_of  # noqa: PLC0415
+
+        tokens: set[str] = set()
+        for queues in (self.queues, self._start_queues):
+            for q in queues.values():
+                for request in q.iter_requests():  # type: ignore[attr-defined]
+                    token = _handoff_token_of(request)
+                    if token is not None:
+                        tokens.add(token)
+        return tokens
 
     def _update_curprio(self) -> None:
         # Keeping an empty queue would hold its storage open for nothing, and

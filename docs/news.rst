@@ -3,6 +3,22 @@
 Release notes
 =============
 
+Scrapy 2.20.1 (unreleased)
+--------------------------
+
+Bug fixes
+~~~~~~~~~
+
+-   Fixed a crash-consistency gap of in-flight request recovery
+    (:setting:`JOBDIR_TRACK_INFLIGHT`): a request removed from the persistent
+    request queue could be lost when the process was killed after that removal
+    but before its in-flight record was written, i.e. before the engine
+    received it. The request is now staged in the in-flight database before
+    the queue entry is removed, and recovery deduplicates the overlap when
+    both copies survive, so a killed handoff always keeps exactly one
+    schedulable instance. Persistence failures during the handoff now end the
+    crawl with an error instead of handing out an unrecoverable request.
+
 Scrapy 2.20.0 (2026-11-06)
 --------------------------
 

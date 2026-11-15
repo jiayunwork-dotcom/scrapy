@@ -177,6 +177,33 @@ every request from the moment it leaves the scheduler until its processing
 reaches its completion boundary. A process killed at any point in between
 re-schedules the request the next time the same job directory is opened.
 
+Crash-safe queue handoff
+------------------------
+
+Removing a request from the persistent request queue and writing its in-flight
+record are two separate writes, so the request could otherwise disappear in
+the narrow window between them: the queue entry is gone but the in-flight
+record does not exist yet.
+
+To close that window, the scheduler stages every disk-backed request in the
+in-flight database *before* removing it from the request queue, and links the
+two persistent copies with an internal handoff token. As a result, a request
+that was successfully enqueued always has at least one durable representation
+while it is being selected, dequeued and handed to the engine:
+
+-   a kill before the staging write leaves the request in the request queue;
+
+-   a kill after the staging write leaves its in-flight record;
+
+-   if both copies survive, reopening the job directory keeps exactly one
+    schedulable instance and discards the duplicated in-flight record, so
+    repeated kills during handoff and recovery can never multiply the same
+    request instance.
+
+The token is scheduler-internal state. It is removed before the request
+reaches the engine, never changes :attr:`~scrapy.Request.dont_filter`, is not
+used for request fingerprints and is not part of the dupefilter history.
+
 Supported configuration
 -----------------------
 
@@ -275,13 +302,19 @@ duplicate items themselves.
 Only requests that follow Scrapy's existing request serialization rules are
 accepted. A request that cannot be serialized is rejected when it is scheduled,
 with the reason logged, rather than being reported as enqueued while only held
-in memory. A failure to write or confirm in-flight records ends the crawl with
-an error and leaves the records on disk for diagnosis, instead of treating the
-request as safely stored or acknowledged.
+in memory. A failure to read, write, remove or confirm the records involved in
+the queue handoff is not hidden behind a log line while the request is handed
+to the engine anyway: the crawl ends through the existing error-based closing
+mechanism with diagnostics, and requests that were durably accepted before the
+failure remain recoverable when the job directory is opened again. When an
+operation has already taken effect and the error only surfaces afterwards,
+Scrapy follows the actual on-disk state rather than assuming the request still
+belongs to the caller that saw the exception.
 
 The in-flight records are removed as requests complete, so both their disk
-footprint and their in-memory state scale with the number of pending and
-in-flight requests rather than with the whole completed crawl history.
+footprint and their in-memory state scale with the number of pending,
+handing-off and in-flight requests rather than with the whole completed crawl
+history.
 
 .. warning:: This feature protects against hard process termination on a
     healthy local machine, such as ``SIGKILL``. It does not cover disk

@@ -12,14 +12,17 @@ never has to rewrite it.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import pickle
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
 from scrapy import Request, Spider, signals
+from scrapy.core import scheduler as scheduler_module
 from scrapy.crawler import CrawlerProcess
 from scrapy.exceptions import DropItem
 from scrapy.utils.defer import _schedule_coro
@@ -46,6 +49,91 @@ class _Barrier:
             time.sleep(0.02)
 
 
+class _HoldingDownloaderMiddleware:
+    """Parks each handoff-mode request in the downloader, after the scheduler
+    handed it over, until the parent releases it or kills the process.
+
+    The request is parked inside an ``await`` loop, so the reactor keeps
+    running and the scheduler keeps dequeuing the remaining manifest requests.
+    With enough downloader concurrency every instance reaches the same
+    handoff boundary and none can complete (and get acknowledged) before the
+    parent kills the process.
+    """
+
+    def __init__(self) -> None:
+        self._seen = 0
+
+    async def process_request(self, request, spider=None):
+        if _CONFIG.get("mode") != "handoff":
+            return
+        from twisted.internet import reactor
+
+        self._seen += 1
+        barrier = _Barrier(Path(_CONFIG["barrier_dir"]))
+        hold = barrier._directory / f"download_hold_{self._seen}"
+        barrier.reach(f"downloader_entered_{self._seen}")
+
+        # Park without blocking the reactor: the scheduler keeps dequeuing the
+        # other manifest requests while this one waits for its release file.
+        while not hold.exists():
+            await asyncio.sleep(0.02)
+            if not reactor.running:  # pragma: no cover - safety net only
+                break
+
+
+class _BarrierScheduler(scheduler_module.Scheduler):
+    """Scheduler variant that records each persistent boundary of the queue ->
+    in-flight handoff behind a file barrier, so the parent test can kill the
+    subprocess at a provably correct point."""
+
+    def _handoff_barrier(self, stage: str) -> None:
+        barrier = _Barrier(Path(_CONFIG["barrier_dir"]))
+        expected = len(_CONFIG.get("manifest", ()))
+        # Count how many requests reached this durable boundary and expose the
+        # stage marker once every manifest instance is accounted for. None of
+        # them can finish before that point: the holding downloader middleware
+        # parks them after they leave the scheduler.
+        marker_count = barrier._directory / f"handoff_{stage}_count"
+        reached = 1
+        if marker_count.exists():
+            reached = int(marker_count.read_text()) + 1
+        marker_count.write_text(str(reached))
+        if expected == 0 or reached >= expected:
+            barrier.reach(f"handoff_{stage}")
+
+    def _handoff_disk_request(self):
+        assert self.dqs is not None
+        assert self._inflight is not None
+        entry = self.dqs.peek_entry()
+        if entry is None:
+            return None
+        entry_id, queued_request = entry
+        self._handoff_barrier("peek")
+        token = scheduler_module._handoff_token_of(queued_request)
+        if token is None:
+            token = scheduler_module._new_handoff_token()
+            queued_request.meta[scheduler_module._HANDOFF_TOKEN_META_KEY] = token
+            if not self.dqs.stamp_entry(entry_id, queued_request):
+                return None
+        data = pickle.dumps(queued_request.to_dict(spider=self.spider), protocol=4)
+        self._inflight.stage(queued_request, data, token)
+        self._handoff_barrier("staged")
+        request = self.dqs.pop_entry(entry_id)
+        self._sync_dqs_state()
+        self._handoff_barrier("popped")
+        if request is None:
+            return None
+        self._inflight.claim(request, token)
+        request.meta.pop(scheduler_module._HANDOFF_TOKEN_META_KEY, None)
+        self.stats.inc_value("scheduler/inflight/tracked")
+        return request
+
+    def _recover_inflight(self) -> None:
+        self._handoff_barrier("recover_start")
+        super()._recover_inflight()
+        self._handoff_barrier("recover_done")
+
+
 class InflightSpider(Spider):
     name = "inflight"
 
@@ -69,6 +157,15 @@ class InflightSpider(Spider):
             priority="spider",
         )
         settings.set("RETRY_TIMES", _CONFIG.get("retry_times", 2), priority="spider")
+        if _CONFIG.get("handoff_barriers"):
+            settings.set(
+                "SCHEDULER", f"{__name__}._BarrierScheduler", priority="spider"
+            )
+            settings.set(
+                "DOWNLOADER_MIDDLEWARES",
+                {f"{__name__}._HoldingDownloaderMiddleware": 100},
+                priority="spider",
+            )
         if _CONFIG.get("disable_tracking"):
             settings.set("JOBDIR_TRACK_INFLIGHT", False, priority="spider")
         if _CONFIG.get("pipeline"):
@@ -96,12 +193,48 @@ class InflightSpider(Spider):
     def _barrier(self) -> _Barrier:
         return _Barrier(self.barrier_dir)
 
+    def _handoff_requests(self):
+        """Build the requests described by the parent's manifest. The manifest
+        is the test's independent record of every instance, including requests
+        sharing a URL, so recovery can be compared against it field by field."""
+        for entry in _CONFIG.get("manifest", []):
+            kwargs: dict[str, Any] = {
+                "dont_filter": entry.get("dont_filter", False),
+                "priority": entry.get("priority", 0),
+                "callback": self.parse_handoff,
+                "meta": {"handoff_id": entry["id"]},
+            }
+            if entry.get("is_start"):
+                kwargs["meta"]["is_start_request"] = True
+            if entry.get("body") is not None:
+                kwargs["body"] = entry["body"].encode()
+                kwargs["method"] = "POST"
+            yield Request(entry["url"], **kwargs)
+
+    def parse_handoff(self, response, **kwargs):
+        yield {
+            "kind": "handoff",
+            "handoff_id": response.meta["handoff_id"],
+            "url": response.url,
+            "method": response.request.method,
+            "priority": response.request.priority,
+            "dont_filter": response.request.dont_filter,
+            "is_start": response.meta.get("is_start_request", False),
+        }
+
     def _maybe_kill(self, stage: str) -> None:
         if self.kill_stage == stage:
             sys.stderr.flush()
             os._exit(1)
 
     async def start(self):
+        if self.mode == "handoff":
+            # The parent process writes the independently recorded instances,
+            # with their full fields, into the manifest; the spider only
+            # enqueues them and lets the scheduler barriers control timing.
+            for request in self._handoff_requests():
+                yield request
+            return
         if self.mode == "duplicate":
             for _ in range(2):
                 yield Request(
