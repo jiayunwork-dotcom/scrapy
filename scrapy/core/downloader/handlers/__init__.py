@@ -227,8 +227,15 @@ class DownloadHandlers:
         self, handler_id: str, handler: DownloadHandlerProtocol, request: Request
     ) -> Response:
         temporary = request.meta["body_file"] is True
+        # Set by SitemapSpider's file-backed mode (see the constant of the same
+        # name in scrapy.spiders._sitemap_files) so its Scrapy-managed temporary
+        # files all live in, and can be reclaimed from, one directory. The
+        # private meta key is referenced by name to avoid an import cycle.
+        temporary_dir = request.meta.get("_sitemap_file_dir")
         if temporary:
-            fd, request.meta["body_file"] = mkstemp()
+            fd, request.meta["body_file"] = mkstemp(
+                dir=temporary_dir if temporary_dir is not None else None
+            )
             os.close(fd)
         try:
             response = await self._download(handler_id, handler, request)
@@ -242,7 +249,7 @@ class DownloadHandlers:
             raise
         except BaseException:
             if temporary:
-                Path(request.meta["body_file"]).unlink()  # noqa: ASYNC240
+                Path(request.meta["body_file"]).unlink(missing_ok=True)  # noqa: ASYNC240
                 # Retries of the request get a new temporary file.
                 request.meta["body_file"] = True
             raise

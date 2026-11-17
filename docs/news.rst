@@ -3,6 +3,22 @@
 Release notes
 =============
 
+Unreleased
+----------
+
+New features
+~~~~~~~~~~~~
+
+-   :class:`~scrapy.spiders.SitemapSpider` gained a
+    :setting:`SITEMAP_FILE_BACKED` setting. When enabled, sitemap documents
+    are downloaded into Scrapy-managed temporary files and parsed lazily from
+    disk instead of being kept in memory, so memory usage no longer grows with
+    the size of a sitemap. HTTP ``gzip``/``deflate`` Content-Encoding layers
+    and a sitemap file's own gzip layer are streamed file-to-file, honoring
+    :setting:`DOWNLOAD_MAXSIZE`, :setting:`DOWNLOAD_WARNSIZE` and
+    :setting:`COMPRESSION_MAX_ENCODINGS`, while robots.txt and final pages
+    keep the regular in-memory behavior.
+
 Scrapy 2.20.0 (2026-11-06)
 --------------------------
 

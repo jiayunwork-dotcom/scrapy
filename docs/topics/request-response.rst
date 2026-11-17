@@ -924,6 +924,15 @@ response header.
 :class:`~scrapy.downloadermiddlewares.httpcache.HttpCacheMiddleware` skips
 these requests.
 
+Requests that :class:`~scrapy.spiders.SitemapSpider` creates internally when
+:setting:`SITEMAP_FILE_BACKED` is enabled use temporary files managed by
+Scrapy and live in a dedicated temporary directory; unlike the files above,
+they are deleted automatically once the corresponding sitemap has been
+processed (or when the spider closes), and their HTTP
+Content-Encoding is streamed file-to-file by
+:class:`~scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware`.
+Only ``gzip`` and ``deflate`` are negotiated for those requests.
+
 Download handlers that do not support this key, such as :ref:`some built-in
 ones <download-handlers-ref>`, make the request fail with
 :exc:`~scrapy.exceptions.NotSupported`.

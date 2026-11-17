@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import warnings
 from io import BytesIO, StringIO
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, BinaryIO
 from urllib.parse import urljoin
 
 import lxml.etree
@@ -17,7 +17,9 @@ class Sitemap:
     """Class to parse Sitemap (type=urlset) and Sitemap Index
     (type=sitemapindex) files"""
 
-    __slots__ = ("type", "xmliter")
+    __slots__ = ("_source_file", "completed", "type", "xmliter")
+
+    xmliter: Any
 
     def __init__(self, xmltext: str | bytes):
         if isinstance(xmltext, str):
@@ -40,17 +42,75 @@ class Sitemap:
         )
         _, root = next(self.xmliter)
         self.type = self._get_tag_name(root)
+        self._source_file: BinaryIO | None = None
+        self.completed: bool = False
+
+    @classmethod
+    def from_file(cls, xmlfile: BinaryIO) -> Sitemap:
+        """Build a sitemap parser that reads *xmlfile* lazily.
+
+        *xmlfile* is a binary file object, typically a temporary file holding
+        a downloaded (and, if needed, decompressed) sitemap. It is read from
+        its current position, which should be the start of the XML document.
+
+        The same recoverable-parsing and entity-handling rules as the regular
+        constructor apply: malformed XML is recovered from while parsing.
+        Errors that are not XML well-formedness issues, notably I/O errors and
+        gzip integrity errors, must be raised by the caller before reaching
+        this parser, so they can never be hidden by the recovery logic.
+
+        The file object is owned by the caller; :meth:`close` closes it, and
+        iteration does not close it on its own.
+        """
+        self = cls.__new__(cls)
+        self.xmliter = lxml.etree.iterparse(
+            xmlfile,
+            recover=True,
+            remove_comments=True,
+            resolve_entities=False,
+            remove_blank_text=True,
+            collect_ids=False,
+            remove_pis=True,
+            events=("start", "end"),
+        )
+        _, root = next(self.xmliter)
+        self.type = self._get_tag_name(root)
+        self._source_file = xmlfile
+        self.completed = False
+        return self
+
+    def close(self) -> None:
+        """Release the parser and, for sitemaps built with :meth:`from_file`,
+        close the underlying file object.
+
+        Safe to call more than once.
+        """
+        self.xmliter = None
+        if self._source_file is not None:
+            self._source_file.close()
+            self._source_file = None
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
-        for event, elem in self.xmliter:
-            if event == "start":
-                continue
+        finished = False
+        try:
+            for event, elem in self.xmliter:
+                if event == "start":
+                    continue
 
-            if self._get_tag_name(elem) not in {"url", "sitemap"}:
-                continue
+                if self._get_tag_name(elem) not in {"url", "sitemap"}:
+                    continue
 
-            if d := self._process_sitemap_element(elem):
-                yield d
+                if d := self._process_sitemap_element(elem):
+                    yield d
+            # Reached only when the document is exhausted without an exception
+            # or an early close() of the generator. On a mid-document
+            # GeneratorExit (or a parser error) this line never runs, so
+            # `completed` stays False: an abandoned file must not count as read
+            # to completion.
+            finished = True
+        finally:
+            if finished:
+                self.completed = True
 
     def _process_sitemap_element(
         self, elem: lxml.etree._Element

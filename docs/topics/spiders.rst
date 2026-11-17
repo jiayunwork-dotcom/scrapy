@@ -575,6 +575,58 @@ Combine SitemapSpider with other sources of urls:
         def parse_other(self, response):
             pass  # ... scrape other here ...
 
+
+File-backed sitemaps
+~~~~~~~~~~~~~~~~~~~~
+
+Large sitemaps can be processed without holding their whole body in memory by
+enabling :setting:`SITEMAP_FILE_BACKED`:
+
+.. code-block:: python
+
+    class MySpider(SitemapSpider):
+        name = "my_spider"
+        custom_settings = {"SITEMAP_FILE_BACKED": True}
+        sitemap_urls = ["http://www.example.com/sitemap.xml"]
+
+        def parse(self, response):
+            pass  # ... scrape item here ...
+
+In this mode every sitemap document — the starting ones, those reached through
+a sitemap index and those listed in ``robots.txt`` — is downloaded into a
+Scrapy-managed temporary file and parsed lazily from disk. Parsing starts as
+soon as the first entries are available and needs no whole-document buffer, so
+memory no longer grows with the sitemap size.
+
+The response passed to :meth:`~SitemapSpider.sitemap_request` for a
+file-backed sitemap is a :class:`~scrapy.http.BodyFileResponse`: its
+:attr:`~scrapy.http.BodyFileResponse.body_file` path holds the decoded XML, and
+its :attr:`~scrapy.http.Response.body` is intentionally unavailable. Read that
+file only while handling the response, for example inside
+:meth:`~SitemapSpider.sitemap_request` or a
+:meth:`~SitemapSpider.sitemap_filter` hook. The file is valid for the whole
+parsing and hook processing of that sitemap, including any
+:meth:`~scrapy.http.Response.replace` copy (copies point at the same file),
+and is deleted once the document is exhausted, its entry stream is closed
+early, or processing fails. When the spider then closes, any file still
+tracked is removed together with its temporary directory. Do not store the
+path for later use and do not add it to the requests built for final pages:
+those requests keep the regular, non-file-backed download path.
+
+``sitemap_filter`` still receives a single-pass iterable of entry dicts and
+must not collect them itself; storing the entries (for example with
+``list()``) defeats the flat-memory guarantee. A hook that stops iterating
+early abandons the rest of the file instead of scanning it.
+
+Compressed sitemaps are handled transparently without loading the compressed
+or the decoded body into memory: HTTP ``gzip``/``deflate``
+Content-Encoding layers are streamed file-to-file, and a sitemap file that is
+itself a gzip document (including one behind an HTTP gzip layer) is gunzipped
+the same way. Only ``gzip`` and ``deflate`` are negotiated over HTTP in this
+mode. Gzip CRC errors, truncated streams, unknown encodings and exceeded
+:setting:`DOWNLOAD_MAXSIZE` limits fail the request explicitly, instead of
+producing an empty or partial map.
+
 .. _scrapy-spider-metadata: https://scrapy-spider-metadata.readthedocs.io/en/latest/params.html
 .. _Sitemaps: https://www.sitemaps.org/index.html
 .. _robots.txt: https://www.robotstxt.org/

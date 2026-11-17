@@ -5,7 +5,8 @@ import sys
 import zlib
 from gzip import GzipFile
 from io import BytesIO
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, BinaryIO
 
 import brotli
 
@@ -133,3 +134,102 @@ def _unzstd(data: bytes, *, max_size: int = 0) -> bytes:
         _check_max_size(decompressed_size, max_size)
         output_stream.write(output_chunk)
     return output_stream.getvalue()
+
+
+def gunzip_file(
+    input_file: BinaryIO,
+    output_file: BinaryIO,
+    *,
+    max_size: int = 0,
+) -> int:
+    """Gunzip *input_file* into *output_file*, streaming the data chunk by
+    chunk, and return the number of decompressed bytes written.
+
+    Unlike :func:`gunzip`, this is strict: gzip CRC errors, truncated streams
+    and other decompression errors are raised instead of returning the data
+    decompressed so far, so that a corrupt compressed body can never be fed to
+    downstream parsing as if it were a complete document.
+
+    Neither file is closed by this function; the caller owns their lifecycle.
+    """
+    gzip_file = GzipFile(fileobj=input_file)
+    decompressed_size = 0
+    while True:
+        # GzipFile.read1() raises BadGzipFile (an OSError subclass) on a CRC or
+        # size mismatch, and EOFError on a truncated stream.
+        chunk = gzip_file.read1(_CHUNK_SIZE)
+        if not chunk:
+            break
+        decompressed_size += len(chunk)
+        _check_max_size(decompressed_size, max_size)
+        output_file.write(chunk)
+    output_file.flush()
+    return decompressed_size
+
+
+def inflate_file(
+    input_file: BinaryIO,
+    output_file: BinaryIO,
+    *,
+    max_size: int = 0,
+) -> int:
+    """Inflate the zlib (or raw deflate, as a fallback) stream of
+    *input_file* into *output_file*, streaming the data chunk by chunk, and
+    return the number of decompressed bytes written.
+
+    Decompression errors and :class:`_DecompressionMaxSizeExceeded` propagate
+    to the caller. Neither file is closed by this function.
+    """
+    try:
+        return _inflate_file(
+            zlib.decompressobj(),
+            input_file,
+            output_file,
+            max_size=max_size,
+        )
+    except zlib.error:
+        # to work with raw deflate content that may be sent by microsoft
+        # servers. Restart from the beginning of both files with a raw
+        # decompressor, mirroring the in-memory _inflate() fallback so no
+        # chunk decoded before the failure is lost.
+        input_file.seek(0)
+        output_file.seek(0)
+        output_file.truncate()
+        return _inflate_file(
+            zlib.decompressobj(wbits=-15),
+            input_file,
+            output_file,
+            max_size=max_size,
+        )
+
+
+def _inflate_file(
+    decompressor: Any,
+    input_file: BinaryIO,
+    output_file: BinaryIO,
+    *,
+    max_size: int,
+) -> int:
+    decompressed_size = 0
+    while True:
+        compressed_chunk = input_file.read(_CHUNK_SIZE)
+        if not compressed_chunk:
+            break
+        chunk = decompressor.decompress(compressed_chunk, _CHUNK_SIZE)
+        decompressed_size += len(chunk)
+        _check_max_size(decompressed_size, max_size)
+        output_file.write(chunk)
+        # Drain any output the decompressor could not fit in the chunk.
+        while decompressor.unconsumed_tail and not decompressor.eof:
+            extra = decompressor.decompress(decompressor.unconsumed_tail, _CHUNK_SIZE)
+            decompressed_size += len(extra)
+            _check_max_size(decompressed_size, max_size)
+            output_file.write(extra)
+    output_file.flush()
+    return decompressed_size
+
+
+def is_gzip_file(path: str | Path) -> bool:
+    """Return whether the file at *path* starts with the gzip magic number."""
+    with Path(path).open("rb") as f:
+        return f.read(3) == b"\x1f\x8b\x08"

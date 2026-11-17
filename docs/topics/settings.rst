@@ -2264,6 +2264,49 @@ For available choices, see :setting:`SCHEDULER_MEMORY_QUEUE`.
     :start-after: queue-common-starts
     :end-before: queue-common-ends
 
+.. setting:: SITEMAP_FILE_BACKED
+
+SITEMAP_FILE_BACKED
+-------------------
+
+Default: ``False``
+
+Whether :class:`~scrapy.spiders.SitemapSpider` downloads and parses sitemap
+documents from temporary files instead of keeping their body in memory.
+
+When enabled, every request to a sitemap document — the starting sitemaps,
+those discovered through a sitemap index, and those listed in
+``robots.txt`` — is downloaded into a Scrapy-managed temporary file, which is
+parsed lazily and deleted as soon as the document has been processed. Memory
+usage therefore stays flat as the size of the sitemap grows, instead of
+growing with the sitemap size.
+
+Requests to ``robots.txt`` and to the final pages discovered in the sitemaps
+keep the regular, in-memory behavior.
+
+Only a real boolean (``True`` or ``False``) is accepted; any other value
+raises :exc:`ValueError` when the spider is created, before the first request
+is sent.
+
+In this mode, requests only negotiate the ``gzip`` and ``deflate`` HTTP
+:requestheader:`Accept-Encoding` encodings, which are streamed from one
+temporary file to another. A sitemap file that is itself a gzip document,
+including one delivered behind an HTTP gzip Content-Encoding layer, is
+gunzipped in the same streaming way. Each decompressed layer is checked
+against :setting:`DOWNLOAD_MAXSIZE` and :setting:`DOWNLOAD_WARNSIZE`, and the
+number of HTTP encoding layers is limited by
+:setting:`COMPRESSION_MAX_ENCODINGS`, independently of the sitemap file's own
+gzip layer. Integrity and truncation errors, unknown encodings and exceeded
+size limits fail the request explicitly rather than being parsed as an empty
+or partial sitemap.
+
+The temporary files are created through the existing ``body_file=True``
+mechanism, so the same HTTP cache bypass and download size checks apply. The
+temporary directory and every file still held when the spider closes are
+removed deterministically, without relying on garbage collection or process
+exit. Files requested explicitly with a user-provided ``body_file`` path are
+never managed or deleted by this mode.
+
 .. setting:: SPIDER_CONTRACTS
 
 SPIDER_CONTRACTS

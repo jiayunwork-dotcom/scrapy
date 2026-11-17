@@ -222,6 +222,7 @@ __all__ = [
     "SCHEDULER_START_DISK_QUEUE",
     "SCHEDULER_START_MEMORY_QUEUE",
     "SCRAPER_SLOT_MAX_ACTIVE_SIZE",
+    "SITEMAP_FILE_BACKED",
     "SPIDER_CONTRACTS",
     "SPIDER_CONTRACTS_BASE",
     "SPIDER_LOADER_CLASS",
@@ -614,6 +615,11 @@ SCHEDULER_START_MEMORY_QUEUE = "scrapy.squeues.FifoMemoryQueue"
 SCRAPER_SLOT_MAX_ACTIVE_SIZE = 5_000_000
 RESPONSE_MAX_ACTIVE_SIZE = 5_000_000
 RESPONSE_ROUGH_SIZE = None
+
+# When enabled, SitemapSpider downloads sitemaps into Scrapy-managed temporary
+# files and parses them from disk, so that memory usage does not grow with the
+# size of the sitemap XML. Only a real boolean is accepted.
+SITEMAP_FILE_BACKED = False
 
 SPIDER_CONTRACTS: dict[str, int] = {}
 SPIDER_CONTRACTS_BASE = {
