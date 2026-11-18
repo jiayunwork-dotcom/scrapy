@@ -685,3 +685,132 @@ class TestCustomExporterItem:
 
 class TestCustomExporterDataclass(TestCustomExporterItem):
     item_class = MyDataClass
+
+
+class TestByteCountingExporters:
+    """Byte accounting of the exporters that support byte-based batching."""
+
+    item = MyItem(name="Jöhn", age="22")
+
+    def _roundtrip(self, exporter_cls, **kwargs):
+        fp = BytesIO()
+        ie = exporter_cls(fp, **kwargs)
+        ie.start_exporting()
+        ie.export_item(self.item)
+        ie.export_item(self.item)
+        ie.finish_exporting()
+        return ie, fp.getvalue()
+
+    def test_json_byte_count(self):
+        for indent in (None, 0, 2):
+            ie, data = self._roundtrip(JsonItemExporter, indent=indent)
+            assert ie.byte_count == len(data)
+            assert json.loads(data) == [dict(self.item), dict(self.item)]
+        ie, data = self._roundtrip(JsonItemExporter, indent=2, encoding="utf-8")
+        assert ie.byte_count == len(data)
+        assert b"\xc3\xb6" in data
+
+    def test_jsonlines_byte_count(self):
+        for encoding in (None, "utf-8", "latin-1"):
+            ie, data = self._roundtrip(JsonLinesItemExporter, encoding=encoding or None)
+            assert ie.byte_count == len(data)
+            assert data.count(b"\n") == 2
+
+    def test_csv_byte_count(self):
+        fp = BytesIO()
+        ie = CsvItemExporter(fp)
+        ie.start_exporting()
+        ie.export_item({"a": 'x,"y"\nz', "b": "é"})
+        ie.export_item({"a": "2", "b": "3"})
+        ie.finish_exporting()
+        data = fp.getvalue()
+        assert ie.byte_count == len(data)
+        assert b'"x,""y""\nz"' in data
+
+    def test_byte_count_before_and_after_finish(self):
+        fp = BytesIO()
+        ie = JsonItemExporter(fp, indent=2)
+        ie.start_exporting()
+        ie.export_item(self.item)
+        partial = ie.byte_count
+        assert partial == len(fp.getvalue())
+        ie.finish_exporting()
+        assert ie.byte_count == len(fp.getvalue())
+        assert ie.byte_count > partial
+
+    def test_unsupported_exporter(self):
+        exporter = BaseItemExporter()
+        with pytest.raises(NotImplementedError):
+            _ = exporter.byte_count
+        assert not exporter.supports_byte_count
+
+    def test_sealed_byte_count_json(self):
+        fp = BytesIO()
+        ie = JsonItemExporter(fp, indent=2)
+        assert ie.supports_byte_count
+        ie.start_exporting()
+        first = ie.encode_item(self.item)
+        assert ie.byte_count == 2  # "[" + "\n"
+        assert ie.sealed_byte_count(first) == len(b"[\n" + first + b"\n]")
+        ie.append_encoded(first)
+        second = ie.encode_item({"name": "x", "age": "1"})
+        expected = len(b"[\n" + first + b",\n" + second + b"\n]")
+        assert ie.sealed_byte_count(second) == expected
+        ie.append_encoded(second)
+        ie.finish_exporting()
+        assert ie.byte_count == expected == len(fp.getvalue())
+
+    def test_sealed_byte_count_jsonlines_and_csv(self):
+        fp = BytesIO()
+        ie = JsonLinesItemExporter(fp)
+        payload = ie.encode_item(self.item)
+        assert ie.sealed_byte_count(payload) == len(payload)
+        ie.append_encoded(payload)
+        assert ie.sealed_byte_count() == len(fp.getvalue())
+
+        fp = BytesIO()
+        ie = CsvItemExporter(fp, fields_to_export=["name", "age"])
+        payload = ie.encode_item(self.item)
+        # The header of the first payload is not written until it is appended.
+        assert ie.sealed_byte_count(payload) == len(b"name,age\r\n") + len(payload)
+        ie.append_encoded(payload)
+        assert ie.sealed_byte_count() == len(fp.getvalue())
+        assert fp.getvalue() == b"name,age\r\nJ\xc3\xb6hn,22\r\n"
+
+    def test_encode_does_not_write(self):
+        for exporter_cls in (JsonItemExporter, JsonLinesItemExporter, CsvItemExporter):
+            fp = BytesIO()
+            ie = exporter_cls(fp)
+            ie.start_exporting()
+            before = len(fp.getvalue())
+            ie.encode_item(self.item)
+            assert len(fp.getvalue()) == before
+            ie.finish_exporting()
+
+    def test_serializer_called_once_per_encode(self):
+        calls = []
+
+        class CountingItem(Item):
+            name = Field(serializer=lambda v: (calls.append(v), v.upper())[1])
+
+        _ie, _ = self._roundtrip_for_item(CountingItem(name="a"))
+        assert calls == ["a"]
+
+    def _roundtrip_for_item(self, item):
+        fp = BytesIO()
+        ie = JsonLinesItemExporter(fp)
+        ie.start_exporting()
+        payload = ie.encode_item(item)
+        ie.append_encoded(payload)
+        ie.sealed_byte_count(payload)
+        ie.finish_exporting()
+        return ie, fp.getvalue()
+
+    def test_exporter_file_is_still_writable_object(self):
+        fp = BytesIO()
+        ie = JsonLinesItemExporter(fp)
+        assert ie.file is not fp
+        ie.start_exporting()
+        ie.export_item(self.item)
+        ie.finish_exporting()
+        assert fp.getvalue()

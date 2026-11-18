@@ -11,13 +11,14 @@ import logging
 import re
 import sys
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from tempfile import NamedTemporaryFile
 from typing import IO, TYPE_CHECKING, Any, Optional, Protocol, TypeVar, cast
 from urllib.parse import unquote, urlparse
 
+from itemadapter import ItemAdapter
 from twisted.internet.defer import Deferred, DeferredList, maybeDeferred
 from twisted.internet.threads import deferToThread
 from w3lib.url import file_uri_to_path
@@ -25,10 +26,12 @@ from zope.interface import Interface, implementer
 
 from scrapy import Spider, signals
 from scrapy.exceptions import NotConfigured, ScrapyDeprecationWarning
-from scrapy.extensions.postprocessing import PostProcessingManager
+from scrapy.exporters import CsvItemExporter, JsonItemExporter, JsonLinesItemExporter
+from scrapy.extensions.postprocessing import GzipPlugin, PostProcessingManager
 from scrapy.utils.conf import feed_complete_default_values_from_settings
 from scrapy.utils.defer import maybe_deferred_to_future
 from scrapy.utils.ftp import ftp_store_file
+from scrapy.utils.io import CountingWriter
 from scrapy.utils.log import failure_to_exc_info
 from scrapy.utils.misc import build_from_crawler, load_object
 from scrapy.utils.python import without_none_values
@@ -52,6 +55,44 @@ logger = logging.getLogger(__name__)
 UriParamsCallableT = Callable[[dict[str, Any], Spider], Optional[dict[str, Any]]]
 
 _StorageT = TypeVar("_StorageT", bound="FeedStorageProtocol")
+
+#: Exporters whose complete serialized output can be measured while exporting
+#: and therefore support byte-based feed batching.
+_BYTE_BATCHING_EXPORTERS = (JsonItemExporter, JsonLinesItemExporter, CsvItemExporter)
+
+_BYTE_BATCHING_METHODS = (
+    "export_item",
+    "start_exporting",
+    "finish_exporting",
+    "encode_item",
+    "append_encoded",
+    "sealed_byte_count",
+)
+
+_BATCH_URI_RE = re.compile(r"%\(batch_time\)s|%\(batch_id\)")
+
+
+def _is_valid_batch_byte_count(value: Any) -> bool:
+    """Return ``True`` for a non-negative integer that is not a ``bool``."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _supports_byte_batching(exporter_cls: type) -> bool:
+    """Whether *exporter_cls* is one of the built-in byte-measuring exporters.
+
+    Subclasses are accepted only if they do not override any method used by
+    the byte-batching code path, since overriding them could change the
+    exact output bytes behind our back.
+    """
+    if getattr(exporter_cls, "supports_byte_count", False) is not True:
+        return False
+    for base in _BYTE_BATCHING_EXPORTERS:
+        if issubclass(exporter_cls, base):
+            return all(
+                getattr(exporter_cls, name) is getattr(base, name)
+                for name in _BYTE_BATCHING_METHODS
+            )
+    return False
 
 
 def build_storage(
@@ -405,23 +446,49 @@ class FeedSlot:
         self.itemcount: int = 0
         self._exporting: bool = False
         self._fileloaded: bool = False
+        self._storage_file: IO[bytes] | None = None
+        self._storage_counter: CountingWriter | None = None
+        self._encoded_counter: CountingWriter | None = None
+        #: Overrides ``feed_options["fields"]`` for this slot, used to keep the
+        #: column layout of byte-batched CSV feeds stable across batches.
+        self._fields_override: Any = None
+        # byte accounting, filled in when the slot is closed
+        self.serialized_bytes: int | None = None
+        self.stored_bytes: int | None = None
+        self.oversized: bool = False
+
+    @property
+    def byte_limit(self) -> int:
+        return self.feed_options.get("batch_byte_count") or 0
 
     def start_exporting(self) -> None:
         if not self._fileloaded:
-            self.file = self.storage.open(self.spider)
+            self._storage_file = self.storage.open(self.spider)
+            self._storage_counter = CountingWriter(self._storage_file)
+            target: IO[bytes] = cast(IO[bytes], self._storage_counter)
             if "postprocessing" in self.feed_options:
-                self.file = cast(
+                target = cast(
                     IO[bytes],
                     PostProcessingManager(
                         self.feed_options["postprocessing"],
-                        self.file,
+                        target,
                         self.feed_options,
                     ),
                 )
+            # Count the encoded bytes at the exporter boundary, before any
+            # post-processing.  This works even for exporters that do not
+            # expose ``byte_count``.
+            self._encoded_counter = CountingWriter(target)
+            self.file = target
+            fields = (
+                self._fields_override
+                if self._fields_override is not None
+                else self.feed_options["fields"]
+            )
             self.exporter = self._get_exporter(
-                file=self.file,
+                file=cast(IO[bytes], self._encoded_counter),
                 format=self.feed_options["format"],
-                fields_to_export=self.feed_options["fields"],
+                fields_to_export=fields,
                 encoding=self.feed_options["encoding"],
                 indent=self.feed_options["indent"],
                 **self.feed_options["item_export_kwargs"],
@@ -446,10 +513,18 @@ class FeedSlot:
             self.exporter.finish_exporting()
             self._exporting = False
 
+    def get_serialized_bytes(self) -> int | None:
+        """Byte size of the complete serialized file."""
+        if self.exporter is None:
+            return None
+        if getattr(self.exporter, "supports_byte_count", False):
+            return self.exporter.byte_count
+        if self._encoded_counter is None:
+            return None
+        return self._encoded_counter.byte_count
+
 
 class FeedExporter:
-    _pending_deferreds: list[Deferred[None]] = []
-
     @classmethod
     def from_crawler(cls, crawler: Crawler) -> Self:
         exporter = cls(crawler)
@@ -464,6 +539,11 @@ class FeedExporter:
         self.feeds = {}
         self.slots: list[FeedSlot] = []
         self.filters: dict[str, ItemFilter] = {}
+        #: Keep pending deferreds per exporter instance so that independent
+        #: feeds/crawlers cannot observe each other's state.
+        self._pending_deferreds: list[Deferred[None]] = []
+        #: CSV column layout resolved from the first accepted item, per feed.
+        self._batch_fields: dict[str, Any] = {}
 
         if not self.settings["FEEDS"] and not self.settings["FEED_URI"]:
             raise NotConfigured
@@ -508,6 +588,8 @@ class FeedExporter:
                 raise NotConfigured
             if not self._exporter_supported(feed_options["format"]):
                 raise NotConfigured
+            if not self._byte_batch_settings_are_valid(uri, feed_options):
+                raise NotConfigured
 
     def open_spider(self, spider: Spider) -> None:
         for uri, feed_options in self.feeds.items():
@@ -540,8 +622,12 @@ class FeedExporter:
             assert slot_.file
             if isinstance(slot_.file, PostProcessingManager):
                 slot_.file.close()
-                return slot_.file.file
-            return slot_.file
+            # Now that the exporter and any plugins have been finalized, the
+            # exact number of bytes handed to the storage is known.
+            assert slot_._storage_counter is not None
+            assert slot_._storage_file is not None
+            slot_.stored_bytes = slot_._storage_counter.byte_count
+            return slot_._storage_file
 
         if slot.itemcount:
             # Normal case
@@ -553,6 +639,10 @@ class FeedExporter:
         else:
             # In this case, the file is not stored, so no processing is required.
             return None
+
+        slot.serialized_bytes = slot.get_serialized_bytes()
+        if slot.byte_limit and slot.serialized_bytes is not None:
+            slot.oversized = slot.oversized or slot.serialized_bytes > slot.byte_limit
 
         logmsg = f"{slot.format} feed ({slot.itemcount} items) in: {slot.uri}"
         d: Deferred[None] = maybeDeferred(slot.storage.store, get_file(slot))  # type: ignore[call-overload]
@@ -599,6 +689,8 @@ class FeedExporter:
         feed_options: dict[str, Any],
         spider: Spider,
         uri_template: str,
+        *,
+        fields_override: list[str] | None = None,
     ) -> FeedSlot:
         """
         Redirect the output data stream to a new file.
@@ -610,7 +702,7 @@ class FeedExporter:
         :param uri_template: template of uri which contains %(batch_time)s or %(batch_id)d to create new uri
         """
         storage = self._get_storage(uri, feed_options)
-        return FeedSlot(
+        slot = FeedSlot(
             storage=storage,
             uri=uri,
             format=feed_options["format"],
@@ -624,6 +716,25 @@ class FeedExporter:
             settings=self.settings,
             crawler=self.crawler,
         )
+        slot._fields_override = fields_override
+        return slot
+
+    def _rotate_slot(self, slot: FeedSlot, spider: Spider) -> FeedSlot:
+        """Close *slot* and start a new batch for the same feed."""
+        feed_options = self.feeds[slot.uri_template]
+        uri_params = self._get_uri_params(spider, feed_options["uri_params"], slot)
+        fields_override = None
+        if slot.byte_limit:
+            fields_override = self._batch_fields.get(slot.uri_template)
+        self._close_slot(slot, spider)
+        return self._start_new_batch(
+            batch_id=slot.batch_id + 1,
+            uri=slot.uri_template % uri_params,
+            feed_options=feed_options,
+            spider=spider,
+            uri_template=slot.uri_template,
+            fields_override=fields_override,
+        )
 
     def item_scraped(self, item: Any, spider: Spider) -> None:
         slots = []
@@ -634,31 +745,99 @@ class FeedExporter:
                 )  # if slot doesn't accept item, continue with next slot
                 continue
 
-            slot.start_exporting()
-            assert slot.exporter
-            slot.exporter.export_item(item)
-            slot.itemcount += 1
-            # create new slot for each slot with itemcount == FEED_EXPORT_BATCH_ITEM_COUNT and close the old one
-            if (
-                self.feeds[slot.uri_template]["batch_item_count"]
-                and slot.itemcount >= self.feeds[slot.uri_template]["batch_item_count"]
-            ):
-                uri_params = self._get_uri_params(
-                    spider, self.feeds[slot.uri_template]["uri_params"], slot
-                )
-                self._close_slot(slot, spider)
-                slots.append(
-                    self._start_new_batch(
-                        batch_id=slot.batch_id + 1,
-                        uri=slot.uri_template % uri_params,
-                        feed_options=self.feeds[slot.uri_template],
-                        spider=spider,
-                        uri_template=slot.uri_template,
-                    )
-                )
-            else:
-                slots.append(slot)
+            slots.append(self._export_item_to_slot(slot, item, spider))
         self.slots = slots
+
+    def _export_item_to_slot(
+        self, slot: FeedSlot, item: Any, spider: Spider
+    ) -> FeedSlot:
+        byte_limit = slot.byte_limit
+        count_limit = self.feeds[slot.uri_template]["batch_item_count"]
+
+        if byte_limit:
+            # Byte batching has been validated at initialization, so the
+            # exporter is guaranteed to support it.
+            return self._export_item_by_size(
+                slot, item, spider, byte_limit, count_limit
+            )
+
+        slot.start_exporting()
+        assert slot.exporter
+        slot.exporter.export_item(item)
+        slot.itemcount += 1
+        if count_limit and slot.itemcount >= count_limit:
+            return self._rotate_slot(slot, spider)
+        return slot
+
+    def _export_item_by_size(
+        self,
+        slot: FeedSlot,
+        item: Any,
+        spider: Spider,
+        byte_limit: int,
+        count_limit: int,
+    ) -> FeedSlot:
+        """Export *item*, rotating the batch when the byte budget is used up.
+
+        The item is serialized exactly once.  The already-encoded payload is
+        reused for the next batch when the current one does not have room for
+        it, so field serializers with side effects are not called twice and
+        the original item is never mutated.
+        """
+        slot.start_exporting()
+        exporter = slot.exporter
+        assert exporter is not None
+        self._apply_batch_fields(slot)
+        payload = exporter.encode_item(item)
+        self._remember_batch_fields(slot, item)
+
+        if slot.itemcount and exporter.sealed_byte_count(payload) > byte_limit:
+            # The next item would push this batch over the limit: finalize the
+            # current (non-empty) batch and start a new one with this payload.
+            slot = self._rotate_slot(slot, spider)
+            slot.start_exporting()
+            exporter = slot.exporter
+            assert exporter is not None
+        exporter.append_encoded(payload)
+        slot.itemcount += 1
+
+        if count_limit and slot.itemcount >= count_limit:
+            return self._rotate_slot(slot, spider)
+        return slot
+
+    def _apply_batch_fields(self, slot: FeedSlot) -> None:
+        """Reuse the column layout pinned by the first batch of a CSV feed."""
+        if slot.format != "csv" or slot.exporter is None:
+            return
+        fields = self._batch_fields.get(slot.uri_template)
+        if fields is not None and not slot.exporter.fields_to_export:
+            slot.exporter.fields_to_export = (
+                dict(fields) if isinstance(fields, dict) else list(fields)
+            )
+
+    def _remember_batch_fields(self, slot: FeedSlot, item: Any) -> None:
+        """Pin the CSV column layout of a byte-batched feed.
+
+        The first accepted item of the feed determines the column order, and
+        later batches reuse it so that every batch repeats the same header.
+        The layout is stored per feed URI template, so different feeds cannot
+        interfere with each other.
+        """
+        if slot.format != "csv" or slot.exporter is None:
+            return
+        if slot.uri_template in self._batch_fields:
+            return
+        fields = slot.exporter.fields_to_export
+        if not fields:
+            # Nobody pinned the fields yet: use the first accepted item, the
+            # same choice CsvItemExporter makes when writing the header.
+            fields = list(ItemAdapter(item).field_names())
+        elif isinstance(fields, Mapping):
+            # Keep the output names of a field mapping.
+            fields = dict(fields)
+        else:
+            fields = list(fields)
+        self._batch_fields[slot.uri_template] = fields
 
     def _load_components(self, setting_prefix: str) -> dict[str, Any]:
         conf = without_none_values(
@@ -682,17 +861,70 @@ class FeedExporter:
         %(batch_time)s or %(batch_id)d to distinguish different files of partial output
         """
         for uri_template, values in self.feeds.items():
-            if values["batch_item_count"] and not re.search(
-                r"%\(batch_time\)s|%\(batch_id\)", uri_template
-            ):
+            if not _is_valid_batch_byte_count(values.get("batch_byte_count", 0)):
                 logger.error(
-                    "%%(batch_time)s or %%(batch_id)d must be in the feed URI (%s) if FEED_EXPORT_BATCH_ITEM_COUNT "
-                    "setting or FEEDS.batch_item_count is specified and greater than 0. For more info see: "
+                    "FEED_EXPORT_BATCH_BYTE_COUNT setting and the "
+                    "FEEDS.batch_byte_count option must be 0 or a non-negative "
+                    "integer, got %(value)r for %(uri)s.",
+                    {"value": values.get("batch_byte_count"), "uri": uri_template},
+                )
+                return False
+            if (
+                values["batch_item_count"] or values.get("batch_byte_count")
+            ) and not _BATCH_URI_RE.search(uri_template):
+                logger.error(
+                    "%%(batch_time)s or %%(batch_id)d must be in the feed URI (%s) "
+                    "if FEED_EXPORT_BATCH_ITEM_COUNT, FEED_EXPORT_BATCH_BYTE_COUNT, "
+                    "FEEDS.batch_item_count or FEEDS.batch_byte_count is specified "
+                    "and greater than 0. For more info see: "
                     "https://docs.scrapy.org/en/latest/topics/feed-exports.html#feed-export-batch-item-count",
                     uri_template,
                 )
                 return False
         return True
+
+    def _byte_batch_settings_are_valid(
+        self, uri: str, feed_options: dict[str, Any]
+    ) -> bool:
+        """Validate the parts of the configuration that only matter when
+        byte-based batching is enabled for *uri*."""
+        if not feed_options.get("batch_byte_count"):
+            # Byte batching is disabled: keep the previous behaviour.
+            return True
+
+        format = feed_options["format"]
+        exporter_cls = self.exporters.get(format)
+        if exporter_cls is None or not _supports_byte_batching(exporter_cls):
+            logger.error(
+                "FEED_EXPORT_BATCH_BYTE_COUNT and the FEEDS.batch_byte_count "
+                "option only support the built-in json, jsonlines and csv "
+                "exporters; %(format)s cannot be used for %(uri)s.",
+                {"format": format, "uri": uri},
+            )
+            return False
+
+        postprocessing = feed_options.get("postprocessing") or []
+        if postprocessing:
+            supported = len(postprocessing) == 1 and self._is_gzip_plugin(
+                postprocessing[0]
+            )
+            if not supported:
+                logger.error(
+                    "FEED_EXPORT_BATCH_BYTE_COUNT and the FEEDS.batch_byte_count "
+                    "option only support no post-processing or a single "
+                    "GzipPlugin; invalid postprocessing for %(uri)s: "
+                    "%(postprocessing)r.",
+                    {"uri": uri, "postprocessing": postprocessing},
+                )
+                return False
+        return True
+
+    @staticmethod
+    def _is_gzip_plugin(plugin: Any) -> bool:
+        try:
+            return load_object(plugin) is GzipPlugin
+        except (TypeError, ValueError, ImportError):
+            return False
 
     def _storage_supported(self, uri: str, feed_options: dict[str, Any]) -> bool:
         scheme = urlparse(uri).scheme

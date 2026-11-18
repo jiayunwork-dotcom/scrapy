@@ -248,6 +248,52 @@ BaseItemExporter
       * ``indent<=0`` each item on its own line, no indentation
       * ``indent>0`` each item on its own line, indented with the provided numeric value
 
+   .. attribute:: byte_count
+
+      The number of bytes written by the exporter so far, including any
+      framing written by :meth:`start_exporting` and
+      :meth:`finish_exporting`.
+
+      This attribute is only available on the exporters that support
+      :ref:`byte-based feed batching <feed-export-batch-byte-count>`:
+      :class:`JsonItemExporter`, :class:`JsonLinesItemExporter` and
+      :class:`CsvItemExporter`. After :meth:`finish_exporting` it gives the
+      exact size of the complete serialized file, which is the same value
+      that feed batching uses.
+
+      On other exporters, accessing it raises
+      :exc:`NotImplementedError`.
+
+      .. versionadded:: 2.14.0
+
+   .. attribute:: supports_byte_count
+
+      ``True`` for exporters that provide :attr:`byte_count` and support
+      byte-based feed batching, ``False`` otherwise.
+
+      .. versionadded:: 2.14.0
+
+   .. method:: encode_item(item)
+
+      Serialize *item* and return an opaque payload, without writing anything.
+      Field serializers are called exactly once, by this method.
+
+      .. versionadded:: 2.14.0
+
+   .. method:: append_encoded(payload)
+
+      Write a payload previously returned by :meth:`encode_item`.
+
+      .. versionadded:: 2.14.0
+
+   .. method:: sealed_byte_count(payload=None)
+
+      Return the byte size that the finished file would have, assuming
+      *payload* (if given) were appended before finishing. Nothing is written
+      and no field serializer is called.
+
+      .. versionadded:: 2.14.0
+
 PythonItemExporter
 ------------------
 

@@ -9,7 +9,7 @@ import marshal
 import pickle
 import pprint
 from collections.abc import Callable, Iterable, Mapping
-from io import BytesIO, TextIOWrapper
+from io import BytesIO, StringIO, TextIOWrapper
 from typing import TYPE_CHECKING, Any
 from xml.sax.saxutils import XMLGenerator
 from xml.sax.xmlreader import AttributesImpl
@@ -17,6 +17,7 @@ from xml.sax.xmlreader import AttributesImpl
 from itemadapter import ItemAdapter, is_item
 
 from scrapy.item import Field, Item
+from scrapy.utils.io import CountingWriter
 from scrapy.utils.python import is_listlike, to_bytes, to_unicode
 from scrapy.utils.serialize import ScrapyJSONEncoder
 
@@ -36,9 +37,54 @@ __all__ = [
 
 
 class BaseItemExporter:
+    #: Whether this exporter provides :attr:`byte_count` and the
+    #: ``encode_item()``/``append_encoded()``/``sealed_byte_count()`` helpers
+    #: used for byte-based feed batching.
+    supports_byte_count: bool = False
+
     def __init__(self, *, dont_fail: bool = False, **kwargs: Any):
         self._kwargs: dict[str, Any] = kwargs
         self._configure(kwargs, dont_fail=dont_fail)
+
+    @property
+    def byte_count(self) -> int:
+        """Number of bytes written by this exporter so far.
+
+        Only exporters that support byte-based feed batching expose this
+        property.  For them the value is exact, i.e. it includes any framing
+        written by :meth:`start_exporting` and :meth:`finish_exporting`.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support byte accounting"
+        )
+
+    def encode_item(self, item: Any) -> Any:
+        """Serialize *item* without writing anything.
+
+        The returned payload is opaque to callers and can later be given to
+        :meth:`append_encoded`.  Field serializers are invoked exactly once,
+        when this method is called.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support byte batching"
+        )
+
+    def append_encoded(self, payload: Any) -> None:
+        """Write a payload returned by :meth:`encode_item`."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support byte batching"
+        )
+
+    def sealed_byte_count(self, payload: Any = None) -> int:
+        """Return the full byte size of the file once it is finished.
+
+        If *payload* is given, it is assumed to be appended (with any
+        separator that would be needed) before finishing.  Nothing is
+        written and no field serializer is called.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support byte batching"
+        )
 
     def _configure(self, options: dict[str, Any], dont_fail: bool = False) -> None:
         """Configure the exporter by popping options from the ``options`` dict.
@@ -109,22 +155,41 @@ class BaseItemExporter:
 
 
 class JsonLinesItemExporter(BaseItemExporter):
+    supports_byte_count = True
+
     def __init__(self, file: BytesIO, **kwargs: Any):
         super().__init__(dont_fail=True, **kwargs)
-        self.file: BytesIO = file
+        self._counter = CountingWriter(file)
+        self.file: BytesIO = self._counter  # type: ignore[assignment]
         self._kwargs.setdefault("ensure_ascii", not self.encoding)
         self.encoder: JSONEncoder = ScrapyJSONEncoder(**self._kwargs)
 
-    def export_item(self, item: Any) -> None:
+    @property
+    def byte_count(self) -> int:
+        return self._counter.byte_count
+
+    def encode_item(self, item: Any) -> bytes:
         itemdict = dict(self._get_serialized_fields(item))
         data = self.encoder.encode(itemdict) + "\n"
-        self.file.write(to_bytes(data, self.encoding))
+        return to_bytes(data, self.encoding)
+
+    def append_encoded(self, payload: bytes) -> None:
+        self.file.write(payload)
+
+    def sealed_byte_count(self, payload: bytes | None = None) -> int:
+        return self.byte_count + (len(payload) if payload is not None else 0)
+
+    def export_item(self, item: Any) -> None:
+        self.append_encoded(self.encode_item(item))
 
 
 class JsonItemExporter(BaseItemExporter):
+    supports_byte_count = True
+
     def __init__(self, file: BytesIO, **kwargs: Any):
         super().__init__(dont_fail=True, **kwargs)
-        self.file: BytesIO = file
+        self._counter = CountingWriter(file)
+        self.file: BytesIO = self._counter  # type: ignore[assignment]
         # there is a small difference between the behaviour or JsonItemExporter.indent
         # and ScrapyJSONEncoder.indent. ScrapyJSONEncoder.indent=None is needed to prevent
         # the addition of newlines everywhere
@@ -135,6 +200,10 @@ class JsonItemExporter(BaseItemExporter):
         self._kwargs.setdefault("ensure_ascii", not self.encoding)
         self.encoder = ScrapyJSONEncoder(**self._kwargs)
         self.first_item = True
+
+    @property
+    def byte_count(self) -> int:
+        return self._counter.byte_count
 
     def _beautify_newline(self) -> None:
         if self.indent is not None:
@@ -147,6 +216,14 @@ class JsonItemExporter(BaseItemExporter):
             self.file.write(b",")
             self._beautify_newline()
 
+    def _item_prefix(self) -> bytes:
+        if self.first_item:
+            return b""
+        return b"," + (b"\n" if self.indent is not None else b"")
+
+    def _finish_bytes(self) -> bytes:
+        return (b"\n" if self.indent is not None else b"") + b"]"
+
     def start_exporting(self) -> None:
         self.file.write(b"[")
         self._beautify_newline()
@@ -155,11 +232,22 @@ class JsonItemExporter(BaseItemExporter):
         self._beautify_newline()
         self.file.write(b"]")
 
-    def export_item(self, item: Any) -> None:
+    def encode_item(self, item: Any) -> bytes:
         itemdict = dict(self._get_serialized_fields(item))
-        data = to_bytes(self.encoder.encode(itemdict), self.encoding)
+        return to_bytes(self.encoder.encode(itemdict), self.encoding)
+
+    def append_encoded(self, payload: bytes) -> None:
         self._add_comma_after_first()
-        self.file.write(data)
+        self.file.write(payload)
+
+    def sealed_byte_count(self, payload: bytes | None = None) -> int:
+        size = self.byte_count
+        if payload is not None:
+            size += len(self._item_prefix()) + len(payload)
+        return size + len(self._finish_bytes())
+
+    def export_item(self, item: Any) -> None:
+        self.append_encoded(self.encode_item(item))
 
 
 class XmlItemExporter(BaseItemExporter):
@@ -220,6 +308,8 @@ class XmlItemExporter(BaseItemExporter):
 
 
 class CsvItemExporter(BaseItemExporter):
+    supports_byte_count = True
+
     def __init__(
         self,
         file: BytesIO,
@@ -232,8 +322,10 @@ class CsvItemExporter(BaseItemExporter):
         if not self.encoding:
             self.encoding = "utf-8"
         self.include_headers_line = include_headers_line
+        self._errors = errors
+        self._counter = CountingWriter(file)
         self.stream = TextIOWrapper(
-            file,
+            self._counter,  # type: ignore[type-var]
             line_buffering=False,
             write_through=True,
             encoding=self.encoding,
@@ -242,7 +334,12 @@ class CsvItemExporter(BaseItemExporter):
         )
         self.csv_writer = csv.writer(self.stream, **self._kwargs)
         self._headers_not_written = True
+        self._header_bytes: bytes | None = None
         self._join_multivalued = join_multivalued
+
+    @property
+    def byte_count(self) -> int:
+        return self._counter.byte_count
 
     def serialize_field(
         self, field: Mapping[str, Any] | Field, name: str, value: Any
@@ -258,14 +355,58 @@ class CsvItemExporter(BaseItemExporter):
                 pass
         return value
 
-    def export_item(self, item: Any) -> None:
-        if self._headers_not_written:
-            self._headers_not_written = False
-            self._write_headers_and_set_fields_to_export(item)
+    def _encode_row(self, values: Iterable[Any]) -> bytes:
+        stream = StringIO(newline="")
+        csv.writer(stream, **self._kwargs).writerow(values)
+        encoding = self.encoding or "utf-8"
+        if self._errors is None:
+            return stream.getvalue().encode(encoding)
+        return stream.getvalue().encode(encoding, self._errors)
 
+    def _header_values(self) -> list[Any] | None:
+        if not self.include_headers_line:
+            return None
+        fields = self.fields_to_export
+        if not fields:
+            return None
+        if isinstance(fields, Mapping):
+            fields = fields.values()
+        return list(self._build_row(fields))
+
+    def _pending_header_bytes(self) -> bytes:
+        if not self._headers_not_written:
+            return b""
+        if self._header_bytes is None:
+            values = self._header_values()
+            self._header_bytes = b"" if values is None else self._encode_row(values)
+        return self._header_bytes
+
+    def encode_item(self, item: Any) -> bytes:
+        if self.include_headers_line and not self.fields_to_export:
+            # Mirrors the field selection done by
+            # _write_headers_and_set_fields_to_export().
+            self._header_bytes = None
+            self.fields_to_export = ItemAdapter(item).field_names()
         fields = self._get_serialized_fields(item, default_value="", include_empty=True)
         values = list(self._build_row(x for _, x in fields))
-        self.csv_writer.writerow(values)
+        return self._encode_row(values)
+
+    def append_encoded(self, payload: bytes) -> None:
+        header = self._pending_header_bytes()
+        if self._headers_not_written:
+            self._headers_not_written = False
+            if header:
+                self._counter.write(header)
+        self._counter.write(payload)
+
+    def sealed_byte_count(self, payload: bytes | None = None) -> int:
+        size = self.byte_count + len(self._pending_header_bytes())
+        if payload is not None:
+            size += len(payload)
+        return size
+
+    def export_item(self, item: Any) -> None:
+        self.append_encoded(self.encode_item(item))
 
     def finish_exporting(self) -> None:
         self.stream.detach()  # Avoid closing the wrapped file.

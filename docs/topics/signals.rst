@@ -337,6 +337,32 @@ feed_slot_closed
     :param slot: the slot closed
     :type slot: scrapy.extensions.feedexport.FeedSlot
 
+    The slot exposes the following read-only attributes:
+
+    .. versionadded:: 2.14.0
+
+    .. attribute:: serialized_bytes
+
+       Number of encoded bytes of the complete serialized file, or ``None`` if
+       the file was not stored. For feeds using an exporter with
+       :ref:`byte accounting <topics-exporters>`, this equals the exporter's
+       ``byte_count`` after ``finish_exporting()``.
+
+    .. attribute:: stored_bytes
+
+       Number of bytes actually handed over to the storage, after any
+       post-processing (e.g. gzip), or ``None`` if the file was not stored.
+       Without post-processing it equals ``serialized_bytes``.
+
+    .. attribute:: oversized
+
+       ``True`` if byte-based batching is enabled and this file exceeds the
+       configured byte limit on its own.
+
+    This signal is sent only after the storage has finished storing the file
+    (that is, after the deferred returned by ``storage.store()`` has fired),
+    and its handlers are awaited before :signal:`feed_exporter_closed` is sent.
+
 
 feed_exporter_closed
 ~~~~~~~~~~~~~~~~~~~~

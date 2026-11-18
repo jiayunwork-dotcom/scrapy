@@ -129,6 +129,7 @@ def feed_complete_default_values_from_settings(
 ) -> dict[str, Any]:
     out = feed.copy()
     out.setdefault("batch_item_count", settings.getint("FEED_EXPORT_BATCH_ITEM_COUNT"))
+    out.setdefault("batch_byte_count", settings.get("FEED_EXPORT_BATCH_BYTE_COUNT", 0))
     out.setdefault("encoding", settings["FEED_EXPORT_ENCODING"])
     out.setdefault("fields", settings.getdictorlist("FEED_EXPORT_FIELDS") or None)
     out.setdefault("store_empty", settings.getbool("FEED_STORE_EMPTY"))

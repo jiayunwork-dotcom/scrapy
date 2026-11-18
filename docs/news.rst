@@ -3,6 +3,21 @@
 Release notes
 =============
 
+.. _release-2.14.0:
+
+Scrapy 2.14.0 (unreleased)
+--------------------------
+
+-   Added :setting:`FEED_EXPORT_BATCH_BYTE_COUNT` and the ``batch_byte_count``
+    feed option, which split feeds into files based on their serialized size
+    instead of (or in addition to) the item count. Supported by the built-in
+    ``json``, ``jsonlines`` and ``csv`` exporters, optionally with a single
+    ``GzipPlugin``. Also added byte accounting to
+    :class:`~scrapy.extensions.postprocessing.PostProcessingManager`
+    (``input_bytes``/``output_bytes``), :attr:`FeedSlot.serialized_bytes`,
+    :attr:`FeedSlot.stored_bytes` and :attr:`FeedSlot.oversized`, and
+    ``byte_count`` to the supported exporters.
+
 .. _release-2.13.3:
 
 Scrapy 2.13.3 (2025-07-02)

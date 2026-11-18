@@ -8,6 +8,7 @@ from io import IOBase
 from lzma import LZMAFile
 from typing import IO, Any, BinaryIO, cast
 
+from scrapy.utils.io import CountingWriter
 from scrapy.utils.misc import load_object
 
 
@@ -129,9 +130,26 @@ class PostProcessingManager(IOBase):
         self, plugins: list[Any], file: IO[bytes], feed_options: dict[str, Any]
     ) -> None:
         self.plugins = self._load_plugins(plugins)
-        self.file = file
+        self.file: IO[bytes] = file
+        self._output_counter = CountingWriter(file)
         self.feed_options = feed_options
+        self._input_bytes = 0
         self.head_plugin = self._get_head_plugin()
+
+    @property
+    def input_bytes(self) -> int:
+        """Number of encoded bytes received by this manager."""
+        return self._input_bytes
+
+    @property
+    def output_bytes(self) -> int:
+        """Number of bytes actually handed over to the target file.
+
+        This includes everything written when the last plugin is closed
+        (e.g. a gzip trailer), since plugins write through
+        :class:`~scrapy.utils.io.CountingWriter`.
+        """
+        return self._output_counter.byte_count
 
     def write(self, data: bytes) -> int:
         """
@@ -142,10 +160,11 @@ class PostProcessingManager(IOBase):
         :return: returns number of bytes written
         :rtype: int
         """
+        self._input_bytes += len(data)
         return cast(int, self.head_plugin.write(data))
 
     def tell(self) -> int:
-        return self.file.tell()
+        return self._output_counter.byte_count
 
     def close(self) -> None:
         """
@@ -160,7 +179,7 @@ class PostProcessingManager(IOBase):
         return [load_object(plugin) for plugin in plugins]
 
     def _get_head_plugin(self) -> Any:
-        prev = self.file
+        prev: Any = self._output_counter
         for plugin in self.plugins[::-1]:
             prev = plugin(prev, self.feed_options)
         return prev

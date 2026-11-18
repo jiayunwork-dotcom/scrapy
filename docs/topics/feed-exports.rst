@@ -297,6 +297,10 @@ in multiple files, with the specified maximum item count per file. That way, as
 soon as a file reaches the maximum item count, that file is delivered to the
 feed URI, allowing item delivery to start way before the end of the crawl.
 
+If the size of the files matters more than the number of items, use
+:setting:`FEED_EXPORT_BATCH_BYTE_COUNT` instead, or in addition, to limit the
+serialized size of each file.
+
 
 .. _item-filter:
 
@@ -378,7 +382,8 @@ Each plugin is a class that must implement the following methods:
 
     Initialize the plugin.
 
-    :param file: file-like object having at least the `write`, `tell` and `close` methods implemented
+    :param file: file-like object having at least the `write` and `close`
+        methods implemented (``tell`` is not required)
 
     :param feed_options: feed-specific :ref:`options <feed-options>`
     :type feed_options: :class:`dict`
@@ -401,6 +406,22 @@ Each plugin is a class that must implement the following methods:
 To pass a parameter to your plugin, use :ref:`feed options <feed-options>`. You
 can then access those parameters from the ``__init__`` method of your plugin.
 
+Measuring post-processed data
+-----------------------------
+
+.. autoclass:: scrapy.extensions.postprocessing.PostProcessingManager
+   :members: input_bytes, output_bytes
+
+``input_bytes`` is the number of encoded bytes received by the manager (i.e.
+the exporter output, before post-processing), while ``output_bytes`` is the
+number of bytes actually handed over to the target file. ``output_bytes``
+includes data written when plugins are closed, such as the gzip header and
+trailer. Neither value depends on the target file supporting ``tell`` or
+``seek``.
+
+.. versionadded:: 2.14.0
+    The ``input_bytes`` and ``output_bytes`` attributes.
+
 
 Settings
 ========
@@ -417,6 +438,7 @@ These are the settings used for configuring the feed exports:
 -   :setting:`FEED_STORAGE_S3_ACL`
 -   :setting:`FEED_EXPORTERS`
 -   :setting:`FEED_EXPORT_BATCH_ITEM_COUNT`
+-   :setting:`FEED_EXPORT_BATCH_BYTE_COUNT`
 
 .. currentmodule:: scrapy.extensions.feedexport
 
@@ -480,6 +502,12 @@ as a fallback value if that key is not provided for a specific feed definition:
     :setting:`FEED_EXPORT_BATCH_ITEM_COUNT`.
 
     .. versionadded:: 2.3.0
+
+-   ``batch_byte_count``: falls back to
+    :setting:`FEED_EXPORT_BATCH_BYTE_COUNT`.
+
+    The maximum size, in bytes, of the serialized content of each output file
+    when byte-based batching is enabled. ``0`` disables byte-based batching.
 
 -   ``encoding``: falls back to :setting:`FEED_EXPORT_ENCODING`.
 
@@ -695,6 +723,8 @@ format in :setting:`FEED_EXPORTERS`. E.g., to disable the built-in CSV exporter
     }
 
 
+.. _feed-export-batch-item-count:
+
 .. setting:: FEED_EXPORT_BATCH_ITEM_COUNT
 
 FEED_EXPORT_BATCH_ITEM_COUNT
@@ -741,6 +771,72 @@ The command line above can generate a directory tree like::
 
 Where the first and second files contain exactly 100 items. The last one contains
 100 items or fewer.
+
+
+.. setting:: FEED_EXPORT_BATCH_BYTE_COUNT
+
+FEED_EXPORT_BATCH_BYTE_COUNT
+----------------------------
+
+Default: ``0``
+
+If assigned an integer number higher than ``0``, Scrapy splits the output into
+multiple files whose complete serialized content does not exceed the specified
+number of bytes.
+
+The limit applies to the encoded bytes of a finished file, before any
+post-processing: for JSON it includes the enclosing brackets, commas and
+indentation, for CSV the header line, quoting and escaping. The compressed size
+of a file (when :ref:`post-processing <post-processing>` is used) is tracked
+separately and does not affect when a new file is started.
+
+The value must be ``0`` or a non-negative integer that is not a ``bool``;
+anything else makes the extension raise :exc:`~scrapy.exceptions.NotConfigured`
+at initialization. A feed can override this setting with the
+``batch_byte_count`` :ref:`feed option <feed-options>`.
+
+When this setting or a given ``batch_byte_count`` feed option is higher than
+``0``, the feed URI must contain a :ref:`batch placeholder
+<feed-export-batch-item-count>` (``%(batch_time)s`` or ``%(batch_id)d``), just
+like with :setting:`FEED_EXPORT_BATCH_ITEM_COUNT`.
+
+Items are added to the current file in the order in which the feed accepts
+them. If adding the next complete item would push the finished file over the
+limit, the current file is finished first and the item is written to a new
+file. A file whose size is exactly the limit is still valid. If a single item
+produces a finished file larger than the limit, it gets a file of its own and
+is marked as oversized; it is never truncated, and the following items start a
+new file. Both this setting and :setting:`FEED_EXPORT_BATCH_ITEM_COUNT` can be
+used at the same time; a new file is started as soon as either limit is
+reached.
+
+Only the built-in ``json``, ``jsonlines`` and ``csv`` exporters are supported,
+optionally combined with a single :class:`~scrapy.extensions.postprocessing.GzipPlugin`.
+With byte-based batching enabled, other exporters or post-processing plugin
+combinations are rejected at initialization. When this setting is ``0``, all
+the previous formats and plugins keep working as before.
+
+For a ``csv`` feed without an explicit ``fields`` option, the fields of the
+first accepted item define the column order, which is then reused, together
+with the header line, by every file of that feed.
+
+For instance:
+
+.. code-block:: python
+
+    FEED_EXPORT_BATCH_BYTE_COUNT = 100 * 1024 * 1024
+
+    FEEDS = {
+        "items-%(batch_id)d.jsonl.gz": {
+            "format": "jsonlines",
+            "postprocessing": ["scrapy.extensions.postprocessing.GzipPlugin"],
+        },
+    }
+
+If a feed stores empty files (:setting:`FEED_STORE_EMPTY`), the empty file is
+also marked as oversized when it exceeds the limit on its own.
+
+.. versionadded:: 2.14.0
 
 
 .. setting:: FEED_URI_PARAMS
