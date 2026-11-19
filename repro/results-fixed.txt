@@ -1,0 +1,38 @@
+FilesPipeline
+  PASS  F1 single download for concurrent items
+  PASS  F1 item A own path
+  PASS  F1 item B own path
+  PASS  F1 checksums match readable files (A)
+  PASS  F1 checksums match readable files (B)
+  PASS  F1 both files on disk
+  PASS  F2 late item gets its own path
+  PASS  F2 second download happened for the new target
+  PASS  F2 per-target cache entries
+  PASS  F3 identical target needs no new download
+  PASS  F3 identical results reused
+  PASS  F4 still one shared download
+  PASS  F4 healthy target delivered
+  PASS  F4 failed target uses failure channel (empty files list)
+  PASS  F4 healthy file exists
+  PASS  F4 failed file absent
+  PASS  F4 failure cached per target
+ImagesPipeline
+  PASS  I4 one download for two concurrent items
+  PASS  I4 same original result for both
+  PASS  I4 same original checksum
+  PASS  I4 thumbnail readable for catalog-a
+  PASS  I4 thumbnail readable for catalog-b
+  PASS  I4 two per-target cache entries
+  PASS  I1 no new download when original+thumbnails fresh
+  PASS  I1 uptodate status
+  PASS  I2 precondition: new catalog thumbnail absent, original present
+  PASS  I2 re-downloaded because thumbnail missing
+  PASS  I2 new thumbnail generated and readable
+  PASS  I3 re-downloaded because thumbnail expired
+  PASS  I3 regenerated with downloaded status
+  PASS  I5 healthy item delivered original
+  PASS  I5 healthy item got its thumbnail
+  PASS  I5 failed item has no images result
+  PASS  I5 failed thumbnail absent
+
+34 passed, 0 failed

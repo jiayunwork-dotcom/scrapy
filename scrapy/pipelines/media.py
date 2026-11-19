@@ -45,6 +45,50 @@ FileInfoOrError = Union[tuple[Literal[True], FileInfo], tuple[Literal[False], Fa
 logger = logging.getLogger(__name__)
 
 
+class _DownloadFanout:
+    """Multicast a single download result to several target Deferreds.
+
+    Targets sharing one request fingerprint reuse the same download, but each
+    target processes the Response independently to produce its own files. A
+    plain callback chain cannot do this (each stage would receive the previous
+    stage's output instead of the download Response), so every fork receives
+    an independent copy of the original result.
+    """
+
+    def __init__(self, download: Deferred[Response]):
+        self.ready: Deferred[Response] = download
+        # Consume a failed download on the shared chain itself; the Failure is
+        # still copied to every fork, which carry the per-target error handling.
+        download.addErrback(lambda failure: failure)
+        download.addBoth(self._fire)
+        self._forks: list[Deferred[Response]] = []
+        self._result: Response | Failure | None = None
+
+    def _fire(self, result: Response | Failure) -> None:
+        self._result = result
+        for fork in self._forks:
+            if isinstance(result, Failure):
+                fork.errback(result)
+            else:
+                fork.callback(result)
+        self._forks.clear()
+
+    def fork(self) -> Deferred[Response]:
+        fork: Deferred[Response] = Deferred()
+        if self._result is None:
+            self._forks.append(fork)
+            return fork
+        # The download already finished, e.g. a synchronous download function:
+        # give the fork an observer before firing it, so a Failure is not
+        # reported as unhandled before the caller attaches its errbacks.
+        fork.addBoth(lambda result: result)
+        if isinstance(self._result, Failure):
+            fork.errback(self._result)
+        else:
+            fork.callback(self._result)
+        return fork
+
+
 class MediaPipeline(ABC):
     crawler: Crawler
     _fingerprinter: RequestFingerprinterProtocol
@@ -55,9 +99,15 @@ class MediaPipeline(ABC):
     class SpiderInfo:
         def __init__(self, spider: Spider):
             self.spider: Spider = spider
+            # fingerprints of requests whose download is in progress. The same
+            # download is never started twice concurrently.
             self.downloading: set[bytes] = set()
-            self.downloaded: dict[bytes, FileInfo | Failure] = {}
-            self.waiting: defaultdict[bytes, list[Deferred[FileInfo]]] = defaultdict(
+            # fan-outs of in-progress downloads, keyed by request fingerprint
+            self.downloads: dict[bytes, _DownloadFanout] = {}
+            # cached terminal results, keyed by target key (see _get_target_key())
+            self.downloaded: dict[Any, FileInfo | Failure] = {}
+            # one deferred per item waiting for a given target result
+            self.waiting: defaultdict[Any, list[Deferred[FileInfo]]] = defaultdict(
                 list
             )
 
@@ -181,34 +231,100 @@ class MediaPipeline(ABC):
         request.callback = NO_CALLBACK
         request.errback = None
 
-        # Return cached result if request was already seen
-        if fp in info.downloaded:
-            d = defer_result(info.downloaded[fp])
+        target = self._get_target_key(request, info, item, fp)
+
+        # Return cached result if this target was already processed.
+        # Results are cached per target, so items sharing a request but
+        # producing different files never receive another item's result.
+        if target in info.downloaded:
+            d = defer_result(info.downloaded[target])
             if eb:
                 d.addErrback(eb)
             return d
 
-        # Otherwise, wait for result
+        # Otherwise, wait for this target's result
         wad: Deferred[FileInfo] = Deferred()
         if eb:
             wad.addErrback(eb)
-        info.waiting[fp].append(wad)
 
-        # Check if request is downloading right now to avoid doing it twice
-        if fp in info.downloading:
+        # Check if this target is being processed right now to avoid doing it
+        # twice. Waiting entries exist exactly while a target is in progress;
+        # they are popped when its result is cached.
+        target_waiters = info.waiting.get(target)
+        if target_waiters is not None:
+            target_waiters.append(wad)
             return wad
+        info.waiting[target].append(wad)
 
-        # Download request checking media_to_download hook output first
-        info.downloading.add(fp)
+        # The first request for this target drives its processing.
         dfd: Deferred[FileInfo | None] = mustbe_deferred(
             self.media_to_download, request, info, item=item
         )
         dfd2: Deferred[FileInfo] = dfd.addCallback(
-            self._check_media_to_download, request, info, item=item
+            self._check_media_to_download, request, info, item=item, fp=fp
         )
         dfd2.addErrback(self._log_exception)
-        dfd2.addBoth(self._cache_result_and_execute_waiters, fp, info)
+        dfd2.addBoth(self._cache_result_and_execute_waiters, target, info)
         return dfd2.addBoth(lambda _: wad)  # it must return wad at last
+
+    def _check_media_to_download(
+        self,
+        result: FileInfo | None,
+        request: Request,
+        info: SpiderInfo,
+        item: Any,
+        fp: bytes | None = None,
+    ) -> FileInfo | Deferred[FileInfo]:
+        if result is not None:
+            return result
+        if fp is None:
+            fp = self._fingerprinter.fingerprint(request)
+
+        # Reuse an in-flight download of the same request, but run
+        # media_downloaded() for this target so its own files are written.
+        if fp in info.downloading:
+            dfd = info.downloads[fp].fork()
+        else:
+            dfd = self._start_download(request, info, fp).fork()
+
+        dfd2: Deferred[FileInfo] = dfd.addCallback(
+            self.media_downloaded, request, info, item=item
+        )
+        dfd2.addErrback(self.media_failed, request, info)
+        return dfd2
+
+    def _start_download(
+        self, request: Request, info: SpiderInfo, fp: bytes
+    ) -> _DownloadFanout:
+        dfd: Deferred[Response]
+        if self.download_func:
+            # this ugly code was left only to support tests. TODO: remove
+            dfd = mustbe_deferred(self.download_func, request, info.spider)
+        else:
+            self._modify_media_request(request)
+            assert self.crawler.engine
+            dfd = self.crawler.engine.download(request)
+
+        # The fan-out shares the (possibly not yet fired) download with later
+        # targets of the same request. It is only shared until the download
+        # itself is done: afterwards the Response is no longer kept around and
+        # new targets download again (or reuse their own up-to-date files
+        # through media_to_download()).
+        fanout = _DownloadFanout(dfd)
+        info.downloading.add(fp)
+        info.downloads[fp] = fanout
+        fanout.ready.addBoth(self._clear_in_flight_download, fp, info)
+        return fanout
+
+    def _clear_in_flight_download(
+        self, result: Response | Failure, fp: bytes, info: SpiderInfo
+    ) -> Response | Failure:
+        # Runs once the shared download itself is finished, after every fork
+        # created up to that point has been scheduled, so late targets simply
+        # start a new download.
+        info.downloading.discard(fp)
+        info.downloads.pop(fp, None)
+        return result
 
     def _log_exception(self, result: Failure) -> Failure:
         logger.exception(result)
@@ -220,27 +336,8 @@ class MediaPipeline(ABC):
         else:
             request.meta["handle_httpstatus_all"] = True
 
-    def _check_media_to_download(
-        self, result: FileInfo | None, request: Request, info: SpiderInfo, item: Any
-    ) -> FileInfo | Deferred[FileInfo]:
-        if result is not None:
-            return result
-        dfd: Deferred[Response]
-        if self.download_func:
-            # this ugly code was left only to support tests. TODO: remove
-            dfd = mustbe_deferred(self.download_func, request, info.spider)
-        else:
-            self._modify_media_request(request)
-            assert self.crawler.engine
-            dfd = self.crawler.engine.download(request)
-        dfd2: Deferred[FileInfo] = dfd.addCallback(
-            self.media_downloaded, request, info, item=item
-        )
-        dfd2.addErrback(self.media_failed, request, info)
-        return dfd2
-
     def _cache_result_and_execute_waiters(
-        self, result: FileInfo | Failure, fp: bytes, info: SpiderInfo
+        self, result: FileInfo | Failure, target: Any, info: SpiderInfo
     ) -> None:
         if isinstance(result, Failure):
             # minimize cached information for failure
@@ -270,10 +367,31 @@ class MediaPipeline(ABC):
             if isinstance(context, StopIteration):
                 result.value.__context__ = None
 
-        info.downloading.remove(fp)
-        info.downloaded[fp] = result  # cache result
-        for wad in info.waiting.pop(fp):
+        info.downloaded[target] = result  # cache result per target
+        for wad in info.waiting.pop(target):
+            # Each waiter gets its own Deferred chain, so Failures are consumed
+            # once per waiter instead of leaving unhandled errors on a shared
+            # download Deferred.
             defer_result(result).chainDeferred(wad)
+
+    def _get_target_key(
+        self,
+        request: Request,
+        info: SpiderInfo,
+        item: Any,
+        fp: bytes | None = None,
+    ) -> Any:
+        """Identify the set of on-disk artifacts this request must deliver for
+        the current item.
+
+        Caching and de-duplication happen per target: equal requests whose
+        target artifacts differ (because ``file_path()`` / ``thumb_path()``
+        take the item into account) are processed independently, while equal
+        requests delivering exactly the same artifacts share the work.
+        """
+        if fp is None:
+            fp = self._fingerprinter.fingerprint(request)
+        return fp
 
     # Overridable Interface
     @abstractmethod

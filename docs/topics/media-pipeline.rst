@@ -29,6 +29,17 @@ being scheduled for download, and connect those responses that arrive containing
 the same media to that queue. This avoids downloading the same media more than
 once when it's shared by several items.
 
+.. note::
+    De-duplication and result caching happen per delivery target, not only per
+    media URL. When a custom :meth:`~scrapy.pipelines.files.FilesPipeline.file_path`
+    (or :meth:`~scrapy.pipelines.images.ImagesPipeline.thumb_path`) stores the
+    same media under item-specific paths, each item gets its own file verified,
+    written and reported, even though the media itself is downloaded only once.
+    For the image pipeline, a fresh original image is reused only when every
+    thumbnail configured for that item is also present and not expired;
+    otherwise the image is downloaded and the item's images (including the
+    thumbnails) are generated again.
+
 Using the Files Pipeline
 ========================
 

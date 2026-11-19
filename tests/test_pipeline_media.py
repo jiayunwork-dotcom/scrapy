@@ -122,17 +122,17 @@ class TestBaseMediaPipeline(unittest.TestCase):
         # Let's calculate the request fingerprint and fake some runtime data...
         fp = self.fingerprint(request)
         info = self.pipe.spiderinfo
-        info.downloading.add(fp)
-        info.waiting[fp] = []
+        target = self.pipe._get_target_key(Request("http://url"), info, item=None, fp=fp)
+        info.waiting[target] = []
 
         # When calling the method that caches the Request's result ...
-        self.pipe._cache_result_and_execute_waiters(failure, fp, info)
+        self.pipe._cache_result_and_execute_waiters(failure, target, info)
         # ... it should store the Twisted Failure ...
-        assert info.downloaded[fp] == failure
+        assert info.downloaded[target] == failure
         # ... encapsulating the original FileException ...
-        assert info.downloaded[fp].value == file_exc
+        assert info.downloaded[target].value == file_exc
         # ... but it should not store the StopIteration exception on its context
-        context = getattr(info.downloaded[fp].value, "__context__", None)
+        context = getattr(info.downloaded[target].value, "__context__", None)
         assert context is None
 
     def test_default_item_completed(self):
@@ -236,7 +236,10 @@ class TestMediaPipeline(TestBaseMediaPipeline):
         )
         item = {"requests": req}
         new_item = yield self.pipe.process_item(item, self.spider)
-        assert new_item["results"] == [(False, fail)]
+        ok, result = new_item["results"][0]
+        assert not ok
+        assert isinstance(result, Failure)
+        assert result.value == fail.value
         assert self.pipe._mockcalled == [
             "get_media_requests",
             "media_to_download",
@@ -254,7 +257,13 @@ class TestMediaPipeline(TestBaseMediaPipeline):
         req2 = Request("http://url2", meta={"response": fail})
         item = {"requests": [req1, req2]}
         new_item = yield self.pipe.process_item(item, self.spider)
-        assert new_item["results"] == [(True, {}), (False, fail)]
+        ok1, result1 = new_item["results"][0]
+        ok2, result2 = new_item["results"][1]
+        assert ok1 is True
+        assert result1 == {}
+        assert ok2 is False
+        assert isinstance(result2, Failure)
+        assert result2.value == fail.value
         m = self.pipe._mockcalled
         # only once
         assert m[0] == "get_media_requests"  # first hook called

@@ -14,16 +14,17 @@ from io import BytesIO
 from typing import TYPE_CHECKING, Any
 
 from itemadapter import ItemAdapter
+from twisted.internet.defer import Deferred, inlineCallbacks, maybeDeferred
 
 from scrapy.exceptions import NotConfigured, ScrapyDeprecationWarning
 from scrapy.http import Request, Response
 from scrapy.http.request import NO_CALLBACK
-from scrapy.pipelines.files import FileException, FilesPipeline, _md5sum
+from scrapy.pipelines.files import FileException, FilesPipeline, StatInfo, _md5sum
 from scrapy.settings import Settings
 from scrapy.utils.python import get_func_args, global_object_name, to_bytes
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Generator, Iterable
     from os import PathLike
 
     from PIL import Image
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
 
     from scrapy import Spider
     from scrapy.crawler import Crawler
-    from scrapy.pipelines.media import FileInfoOrError, MediaPipeline
+    from scrapy.pipelines.media import FileInfo, FileInfoOrError, MediaPipeline
 
 
 class ImageException(FileException):
@@ -135,6 +136,48 @@ class ImagesPipeline(FilesPipeline):
                 category=ScrapyDeprecationWarning,
             )
         return o
+
+    @inlineCallbacks
+    def media_to_download(
+        self, request: Request, info: MediaPipeline.SpiderInfo, *, item: Any = None
+    ) -> Generator[Deferred[Any], Any, FileInfo | None]:
+        # The parent logic verifies the original image for this item.
+        result: FileInfo | None = yield super().media_to_download(
+            request, info, item=item
+        )
+        if result is None:
+            return None
+
+        # A fresh original image alone is not enough: every thumbnail this
+        # item is configured to deliver must exist at its own (item-aware)
+        # path and be fresh as well. A missing or expired thumbnail forces a
+        # new download and regeneration of the whole image set for this item.
+        for thumb_id in self.thumbs:
+            thumb_path = self.thumb_path(
+                request, thumb_id, info=info, item=item
+            )
+            stat: StatInfo = yield maybeDeferred(
+                self.store.stat_file, thumb_path, info
+            )
+            if not self._is_file_fresh(stat):
+                return None
+        return result
+
+    def _get_target_key(
+        self,
+        request: Request,
+        info: MediaPipeline.SpiderInfo,
+        item: Any,
+        fp: bytes | None = None,
+    ) -> Any:
+        path = self.file_path(request, info=info, item=item)
+        thumb_paths = tuple(
+            self.thumb_path(request, thumb_id, info=info, item=item)
+            for thumb_id in self.thumbs
+        )
+        if fp is None:
+            fp = self._fingerprinter.fingerprint(request)
+        return fp, path, thumb_paths
 
     def file_downloaded(
         self,

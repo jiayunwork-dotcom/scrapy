@@ -1,0 +1,38 @@
+FilesPipeline
+  PASS  F1 single download for concurrent items
+  PASS  F1 item A own path
+  FAIL  F1 item B own path [{'url': 'http://example.com/shared-manual.pdf', 'path': 'catalog-a/manual.bin', 'checksum': 'ea48e228e0dd2f8505b8fe1a874a8416', 'status': 'downloaded'}]
+  PASS  F1 checksums match readable files (A)
+  FAIL  F1 checksums match readable files (B) 
+  FAIL  F1 both files on disk 
+  FAIL  F2 late item gets its own path [{'url': 'http://example.com/shared-manual.pdf', 'path': 'catalog-a/manual.bin', 'checksum': 'ea48e228e0dd2f8505b8fe1a874a8416', 'status': 'downloaded'}]
+  FAIL  F2 second download happened for the new target 
+  FAIL  F2 per-target cache entries 
+  FAIL  F3 identical target needs no new download 
+  PASS  F3 identical results reused
+  FAIL  F4 still one shared download 
+  FAIL  F4 healthy target delivered 
+  FAIL  F4 failed target uses failure channel (empty files list) 
+  FAIL  F4 healthy file exists 
+  PASS  F4 failed file absent
+  FAIL  F4 failure cached per target 
+ImagesPipeline
+  PASS  I4 one download for two concurrent items
+  PASS  I4 same original result for both
+  PASS  I4 same original checksum
+  PASS  I4 thumbnail readable for catalog-a
+  FAIL  I4 thumbnail readable for catalog-b 
+  FAIL  I4 two per-target cache entries 
+  PASS  I1 no new download when original+thumbnails fresh
+  PASS  I1 uptodate status
+  PASS  I2 precondition: new catalog thumbnail absent, original present
+  FAIL  I2 re-downloaded because thumbnail missing 
+  FAIL  I2 new thumbnail generated and readable 
+  FAIL  I3 re-downloaded because thumbnail expired 
+  FAIL  I3 regenerated with downloaded status 
+  PASS  I5 healthy item delivered original
+  FAIL  I5 healthy item got its thumbnail 
+  FAIL  I5 failed item has no images result 
+  PASS  I5 failed thumbnail absent
+
+14 passed, 20 failed

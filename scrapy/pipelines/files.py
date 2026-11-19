@@ -564,16 +564,7 @@ class FilesPipeline(MediaPipeline):
         self, request: Request, info: MediaPipeline.SpiderInfo, *, item: Any = None
     ) -> Deferred[FileInfo | None]:
         def _onsuccess(result: StatInfo) -> FileInfo | None:
-            if not result:
-                return None  # returning None force download
-
-            last_modified = result.get("last_modified", None)
-            if not last_modified:
-                return None  # returning None force download
-
-            age_seconds = time.time() - last_modified
-            age_days = age_seconds / 60 / 60 / 24
-            if age_days > self.expires:
+            if not self._is_file_fresh(result):
                 return None  # returning None force download
 
             referer = referer_str(request)
@@ -606,6 +597,35 @@ class FilesPipeline(MediaPipeline):
             )
         )
         return dfd2
+
+    def _is_file_fresh(self, result: StatInfo) -> bool:
+        """Whether a stored file described by ``stat_file()`` output may be
+        reused instead of being downloaded again."""
+        if not result:
+            return False
+
+        last_modified = result.get("last_modified", None)
+        if not last_modified:
+            return False
+
+        age_seconds = time.time() - last_modified
+        age_days = age_seconds / 60 / 60 / 24
+        return age_days <= self.expires
+
+    def _get_target_key(
+        self,
+        request: Request,
+        info: MediaPipeline.SpiderInfo,
+        item: Any,
+        fp: bytes | None = None,
+    ) -> Any:
+        # The fingerprint keeps the de-duplication of identical requests and
+        # the item-aware storage path makes every item's file a distinct
+        # target that must be delivered (and verified) on its own.
+        path = self.file_path(request, info=info, item=item)
+        if fp is None:
+            fp = self._fingerprinter.fingerprint(request)
+        return fp, path
 
     def media_failed(
         self, failure: Failure, request: Request, info: MediaPipeline.SpiderInfo
