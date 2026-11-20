@@ -627,6 +627,16 @@ mode. Gzip CRC errors, truncated streams, unknown encodings and exceeded
 :setting:`DOWNLOAD_MAXSIZE` limits fail the request explicitly, instead of
 producing an empty or partial map.
 
+Decompression runs in a worker thread, and cancelling the coroutine that
+waits for it cannot stop that thread. If the download of a sitemap is
+cancelled while its body is being decompressed, the cancellation still
+propagates to the caller as usual, and the decoded file the thread keeps
+producing is reclaimed in the background as soon as the thread finishes —
+no response is delivered, no decompression stats are counted and nothing is
+left for the spider-close sweep. Likewise, the spider close is not
+considered finished while a decompression is still running: it waits for
+the worker thread, then removes every file that is still tracked.
+
 .. _scrapy-spider-metadata: https://scrapy-spider-metadata.readthedocs.io/en/latest/params.html
 .. _Sitemaps: https://www.sitemaps.org/index.html
 .. _robots.txt: https://www.robotstxt.org/

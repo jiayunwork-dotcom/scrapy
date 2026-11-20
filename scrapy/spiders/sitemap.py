@@ -180,9 +180,11 @@ class SitemapSpider(Spider):
             crawler.signals.connect(spider._robots_parsed, signals.robots_parsed)
         return spider
 
-    def _close_sitemap_file_registry(self) -> None:
+    async def _close_sitemap_file_registry(self) -> None:
         if self._sitemap_file_registry is not None:
-            self._sitemap_file_registry.close()
+            # Waits for in-flight decompression tasks to settle their files
+            # before the directory is swept.
+            await self._sitemap_file_registry.close_async()
             self._sitemap_file_registry = None
 
     def __init__(self, *a: Any, **kw: Any):

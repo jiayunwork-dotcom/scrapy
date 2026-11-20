@@ -19,6 +19,16 @@ New features
     :setting:`COMPRESSION_MAX_ENCODINGS`, while robots.txt and final pages
     keep the regular in-memory behavior.
 
+Bug fixes
+~~~~~~~~~
+
+-   Fixed a temporary-file leak in the :setting:`SITEMAP_FILE_BACKED` mode:
+    cancelling a sitemap download while its HTTP Content-Encoding was being
+    decompressed in a worker thread no longer leaves the decoded file behind,
+    and the sitemap temporary-file registry now waits for in-flight
+    decompression tasks before it considers the spider close finished and
+    rejects files registered after it was closed.
+
 Scrapy 2.20.0 (2026-11-06)
 --------------------------
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import warnings
 from itertools import chain
@@ -16,7 +17,7 @@ from scrapy.exceptions import (
 )
 from scrapy.http import BodyFileResponse, Response, TextResponse
 from scrapy.responsetypes import responsetypes
-from scrapy.spiders._sitemap_files import SITEMAP_FILE_BACKED_META
+from scrapy.spiders._sitemap_files import SITEMAP_FILE_BACKED_META, RegistryClosedError
 from scrapy.utils._compression import (
     _DECOMPRESSION_ERRORS,
     _DecompressionMaxSizeExceeded,
@@ -28,13 +29,15 @@ from scrapy.utils._compression import (
     inflate_file,
 )
 from scrapy.utils._download_handlers import get_warnsize
-from scrapy.utils.asyncio import run_in_thread
+from scrapy.utils.asyncio import is_asyncio_available, run_in_thread
 from scrapy.utils.decorators import _warn_spider_arg
 from scrapy.utils.deprecate import warn_on_deprecated_spider_attribute
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from scrapy.crawler import Crawler
-    from scrapy.spiders._sitemap_files import SitemapFileRegistry
+    from scrapy.spiders._sitemap_files import SitemapFileRegistry, _DecodeSlot
     from scrapy.statscollectors import StatsCollector
 
 
@@ -225,6 +228,15 @@ class HttpCompressionMiddleware:
         the file its ``body_file`` points at changes as layers are stripped.
         Each intermediate file is deleted once the next layer has been written.
         All blocking file I/O runs in a worker thread.
+
+        The decode is registered with the spider's
+        :class:`~scrapy.spiders._sitemap_files.SitemapFileRegistry` for as
+        long as it may create files, so that the registry close never treats
+        an in-flight decode as already reclaimed. If this coroutine is
+        cancelled, the cancellation propagates unchanged and the decode
+        output is reclaimed in the background once the worker thread
+        finishes; if the spider starts closing while a decode runs, its
+        result is released instead of being delivered.
         """
         content_encoding = response.headers.getlist("Content-Encoding")
         if not content_encoding:
@@ -263,14 +275,75 @@ class HttpCompressionMiddleware:
             spider, "_sitemap_file_registry", None
         )
         assert registry is not None
-        try:
-            final_path, layer_sizes = await run_in_thread(
-                _decode_sitemap_file_layers,
-                Path(response.body_file),
-                to_decode,
-                registry,
-                max_size,
+        final_path, layer_sizes = await self._decode_sitemap_file(
+            response, registry, content_encoding, to_decode, max_size
+        )
+
+        if registry.closing:
+            # The spider started closing while the decode was running: the
+            # decoded file must not be delivered as a normal response, so it
+            # is released instead of being handed to the parser.
+            registry.release(final_path)
+            raise IgnoreRequest(
+                f"Ignored response {response} because the spider is closing."
             )
+
+        for decoded_size in layer_sizes:
+            if self.stats:
+                self.stats.inc_value("httpcompression/response_bytes", decoded_size)
+                self.stats.inc_value("httpcompression/response_count")
+            if warn_size and decoded_size >= warn_size:
+                logger.warning(
+                    f"{response} body size after decompression "
+                    f"({decoded_size} B) is larger than or equal to the "
+                    f"download warning size ({warn_size} B)."
+                )
+        response.headers["Content-Encoding"] = to_keep
+        if not to_keep:
+            del response.headers["Content-Encoding"]
+        return response.replace(body_file=final_path)
+
+    async def _decode_sitemap_file(
+        self,
+        response: BodyFileResponse,
+        registry: SitemapFileRegistry,
+        content_encoding: list[bytes],
+        to_decode: list[bytes],
+        max_size: int,
+    ) -> tuple[Path, list[int]]:
+        """Run the file-to-file decode of *response*'s body file under a
+        registry decode slot, translating worker-thread failures into the
+        middleware's usual exceptions."""
+        body_path = Path(response.body_file)
+        try:
+            slot = registry.begin_decode()
+        except RegistryClosedError as e:
+            # The spider is closing and its temporary files are being
+            # reclaimed; this response cannot be delivered anymore, so its
+            # body file goes back to the registry instead of the parser.
+            registry.release(body_path)
+            raise IgnoreRequest(
+                f"Ignored response {response} because the sitemap file "
+                f"registry is closed."
+            ) from e
+        try:
+            if is_asyncio_available():
+                return await self._decode_file_backed(
+                    registry, slot, body_path, to_decode, max_size
+                )
+            # Deprecated non-asyncio reactor: the thread wait cannot be
+            # shielded, so a cancellation here abandons the decode output to
+            # the registry sweep on close.
+            try:
+                return await run_in_thread(
+                    _decode_sitemap_file_layers,
+                    body_path,
+                    to_decode,
+                    registry,
+                    max_size,
+                )
+            finally:
+                slot.close()
         except _DecompressionMaxSizeExceeded as e:
             msg = (
                 f"Ignored response {response} because its decompressed body "
@@ -284,25 +357,55 @@ class HttpCompressionMiddleware:
             raise DecompressionError(
                 f"Could not decompress {response} ({encodings}): {e}"
             ) from e
+        except RegistryClosedError as e:
+            # The registry was synchronously closed while the decode thread
+            # was running; the thread already removed its files.
+            raise IgnoreRequest(
+                f"Ignored response {response} because the sitemap file "
+                f"registry was closed during decompression."
+            ) from e
         except OSError as e:
             raise DecompressionError(f"Could not decompress {response}: {e}") from e
 
-        for decoded_size in layer_sizes:
-            if self.stats:
-                self.stats.inc_value(
-                    "httpcompression/response_bytes", decoded_size
-                )
-                self.stats.inc_value("httpcompression/response_count")
-            if warn_size and decoded_size >= warn_size:
-                logger.warning(
-                    f"{response} body size after decompression "
-                    f"({decoded_size} B) is larger than or equal to the "
-                    f"download warning size ({warn_size} B)."
-                )
-        response.headers["Content-Encoding"] = to_keep
-        if not to_keep:
-            del response.headers["Content-Encoding"]
-        return response.replace(body_file=final_path)
+    async def _decode_file_backed(
+        self,
+        registry: SitemapFileRegistry,
+        slot: _DecodeSlot,
+        body_path: Path,
+        to_decode: list[bytes],
+        max_size: int,
+    ) -> tuple[Path, list[int]]:
+        """Await the file-to-file decode of *body_path*, shielded from
+        cancellation.
+
+        Cancelling this coroutine cannot stop the worker thread, so the
+        decode runs on a shielded task whose handle survives the
+        cancellation: a done callback then reclaims whatever the thread
+        still produces, settles the decode slot, and retrieves any thread
+        exception. The cancellation itself still propagates to the caller,
+        and neither a success response nor decompression stats are produced
+        for it.
+        """
+        decode_task = asyncio.ensure_future(
+            run_in_thread(
+                _decode_sitemap_file_layers,
+                body_path,
+                to_decode,
+                registry,
+                max_size,
+            )
+        )
+        disposed = False
+        try:
+            return await asyncio.shield(decode_task)
+        except asyncio.CancelledError:
+            decode_task.add_done_callback(_dispose_cancelled_decode(slot, registry))
+            # The slot now belongs to the done callback.
+            disposed = True
+            raise
+        finally:
+            if not disposed:
+                slot.close()
 
     async def _handle_encoding(
         self, body: bytes, content_encoding: list[bytes], max_size: int
@@ -364,6 +467,51 @@ def _file_size(path: Path) -> int:
     return path.stat().st_size
 
 
+def _dispose_cancelled_decode(
+    slot: _DecodeSlot, registry: SitemapFileRegistry
+) -> Callable[[asyncio.Future[tuple[Path, list[int]]]], None]:
+    """Return a done callback reclaiming the output of a decode whose
+    awaiting coroutine was cancelled.
+
+    The worker thread keeps running after the cancellation; once it
+    finishes, this releases the decoded file it produced (the thread itself
+    already removed its files on failure), retrieves any thread exception so
+    it is never reported as unretrieved, and settles the decode slot so the
+    registry close can finish. Cleanup errors are logged, never raised:
+    there is no caller left to report them to, and they must not mask the
+    cancellation.
+    """
+
+    def dispose(decode_task: asyncio.Future[tuple[Path, list[int]]]) -> None:
+        try:
+            try:
+                final_path, _layer_sizes = decode_task.result()
+            except asyncio.CancelledError:
+                logger.debug(
+                    "The decode task of a cancelled file-backed sitemap "
+                    "download was itself cancelled."
+                )
+                return
+            except Exception:
+                logger.exception(
+                    "Decompression of a cancelled file-backed sitemap "
+                    "download failed; its temporary files were removed."
+                )
+                return
+            try:
+                registry.release(final_path)
+            except Exception:
+                logger.exception(
+                    "Could not remove the decoded file %s left by a "
+                    "cancelled file-backed sitemap download.",
+                    final_path,
+                )
+        finally:
+            slot.close()
+
+    return dispose
+
+
 def _decode_sitemap_file_layers(
     body_path: Path,
     encodings: list[bytes],
@@ -379,7 +527,10 @@ def _decode_sitemap_file_layers(
 
     On failure, the partial output and the files still held are removed, so
     failed attempts never leave files behind. Decompression and size-limit
-    exceptions propagate unchanged to the caller.
+    exceptions propagate unchanged to the caller, as does
+    :exc:`~scrapy.spiders._sitemap_files.RegistryClosedError` if the registry
+    was swept while decoding (its files are gone by then, and the removal
+    above degrades to a no-op).
     """
 
     def remove(path: Path) -> None:
@@ -395,9 +546,10 @@ def _decode_sitemap_file_layers(
     try:
         for encoding in encodings:
             next_path = current_path.with_name(current_path.name + ".dec")
-            with current_path.open("rb") as input_file, next_path.open(
-                "wb"
-            ) as output_file:
+            with (
+                current_path.open("rb") as input_file,
+                next_path.open("wb") as output_file,
+            ):
                 if encoding in {b"gzip", b"x-gzip"}:
                     decoded_size = gunzip_file(
                         input_file, output_file, max_size=max_size

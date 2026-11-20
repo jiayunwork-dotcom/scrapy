@@ -263,7 +263,7 @@ def test_setting_default_is_off_and_enabled():
     assert spider_on._sitemap_file_backed is True
     assert spider_on._sitemap_file_registry is not None
     assert spider_on._sitemap_file_registry.directory.exists()
-    spider_on._close_sitemap_file_registry()
+    spider_on._sitemap_file_registry.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -783,12 +783,12 @@ async def test_hook_exception_releases_file_and_keeps_crawl_going(http_server):
         def parse(self, response, **kwargs):
             yield {"url": response.url}
 
-        def _close_sitemap_file_registry(self):
+        async def _close_sitemap_file_registry(self):
             assert self._sitemap_file_registry is not None
             released.extend(
                 str(path) for path in tuple(self._sitemap_file_registry._paths)
             )
-            super()._close_sitemap_file_registry()
+            await super()._close_sitemap_file_registry()
 
     _, items = await run_crawl(
         _Spider,

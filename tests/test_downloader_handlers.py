@@ -6,6 +6,7 @@ import contextlib
 import os
 from pathlib import Path
 from tempfile import mkdtemp, mkstemp
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -277,8 +278,8 @@ class TestBodyFile:
         created: list[str] = []
         real_mkstemp = mkstemp
 
-        def mock_mkstemp() -> tuple[int, str]:
-            fd, path = real_mkstemp()
+        def mock_mkstemp(**kwargs: Any) -> tuple[int, str]:
+            fd, path = real_mkstemp(**kwargs)
             created.append(path)
             return fd, path
 

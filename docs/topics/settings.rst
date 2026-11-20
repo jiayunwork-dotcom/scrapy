@@ -2307,6 +2307,14 @@ removed deterministically, without relying on garbage collection or process
 exit. Files requested explicitly with a user-provided ``body_file`` path are
 never managed or deleted by this mode.
 
+Decompression of the HTTP encoding layers runs in a worker thread. Cancelling
+the download of a sitemap cannot stop that thread, so the cancellation is
+reported to the caller immediately and the files the thread still produces
+are reclaimed in the background once it finishes, without delivering a
+response or counting decompression stats for it. The spider close waits for
+any decompression still in progress before it removes the temporary
+directory, so no file is ever left without an owner.
+
 .. setting:: SPIDER_CONTRACTS
 
 SPIDER_CONTRACTS
